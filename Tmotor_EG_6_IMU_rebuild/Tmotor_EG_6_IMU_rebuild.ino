@@ -1,0 +1,666 @@
+/******************** 必要的包含 ********************/
+#include <Arduino.h>
+#include <math.h>
+#include <cstring>
+#include <iomanip> 
+#include <FlexCAN_T4.h>
+#include "Serial_Com.h"
+#include "IMU_Adapter.h"
+#include "MovingAverage.h"
+#include "Motor_Control_Tmotor.h"
+#include "SdFat.h"
+#include "RingBuf.h"
+#include "sdlogger.h" 
+#ifndef DEBUG_PRINT
+#define DEBUG_PRINT 1   // 改成 0 关闭所有调试打印
+#endif
+
+const unsigned long PRINT_INTERVAL_US = 100000; // 10 Hz
+static unsigned long prev_print_us = 0;
+
+/******************** 常量/类型 ********************/
+const float DEG2RAD = PI / 180.0f;
+
+// Teensy CAN3
+FlexCAN_T4<CAN3, RX_SIZE_256, TX_SIZE_16> Can3;
+
+// SdLogger：自动按前缀+递增命名，例如 walking_log_0001.csv
+SdLogger logger(BUILTIN_SDCARD, F("walking_log_"), F(".csv"));
+
+// SDIO 配置（如你后续需要直接用 SdFat，可继续用）
+#define SD_CONFIG SdioConfig(FIFO_SDIO)
+
+// 频率设置
+double cyclespersec_ctrl = 100;   // [Hz] 控制循环频率（CAN上限1000Hz）
+double cyclespersec_ble  = 20;    // [Hz] 蓝牙发送频率
+unsigned long Tinterval_ctrl_micros = (unsigned long)(1000000.0 / cyclespersec_ctrl);
+unsigned long Tinterval_ble_micros  = (unsigned long)(1000000.0 / cyclespersec_ble);
+static float tau_cmd_L_filt = 0.0f;
+static float tau_cmd_R_filt = 0.0f;
+/******************** 设备对象 ********************/
+// 单电机示例（你的 ID/总线保持不变）
+int CAN_ID = 3;                       // 总线地址（你的代码里就是3）
+/*MOTOR*/    
+float initial_pos_1 = 0;       
+float initial_pos_2 = 0;     
+Motor_Control_Tmotor sig_m1(0x002, CAN_ID);
+Motor_Control_Tmotor sig_m2(0x001, CAN_ID);
+
+// 通讯与传感
+Serial_Com Serial_Com;                // 你已有的串口通讯类
+IMU_Adapter imu;                      // IMU 适配器
+
+/******************** 蓝牙缓冲（与你一致） ********************/
+char datalength_ble = 32;
+char data_ble[60] = {0};
+uint8_t data_rs232_rx[60] = {0};  // <-- char → uint8_t
+
+// IMU 初始化状态（新增）
+volatile uint8_t imu_init_ok = 0;    // 0=未通过, 1=通过
+
+// 你声明过的延时/环形缓存（日志里有用到）
+double RLTx_delay[100]   = {};
+double torque_delay[100] = {};
+int doi = 0;
+int delayindex   = 0;    
+
+//*** Motor Mode Set ***//   
+int ctl_method = 1;    // 0 for using RL controller, 1 for using other normal controller  
+int ctl_mode = 0;      // 0 for torque control, 1 for mit control    
+int ctl_type = 0;      // 0 for motion, 1 for force tracking, 2 for direct torque   
+
+int sensor_type = 0;   // 0 for using IMU, 1 for using encoder   
+int l_ctl_dir = 1;      //确实是左脚，1是向上
+int r_ctl_dir = -1;     //确实是右脚，1是向上
+
+
+
+/******************** 控制/算法相关占位（将来替换） ********************/
+// —— 这些量目前只为“能编译+能记录”，实际算法稍后接回 ——
+
+// 电机命令 & 实测
+float  M1_torque_meas = 0.0f, M2_torque_meas = 0.0f;
+double M1_torque_command = 0.0, M2_torque_command = 0.0;
+
+// IMU 与派生量（日志里会用到）
+double LTx_filtered = 0, LTx_filtered_last = 0;
+double RTx_filtered = 0, RTx_filtered_last = 0;
+double RLTx              = 0;
+double RLTx_filtered     = 0;
+
+
+// GUI/参数（蓝牙下发写入）
+double Rescaling_gain    = 5.0;
+double Flex_Assist_gain  = 2.5;
+double Ext_Assist_gain   = 2.5;
+double Assist_delay_gain = 0.0;
+/* ======= ① 新增全局参数 ======= */
+int8_t phase_offset_L = 0;   // << 你可以开 BLE 命令实时改
+int8_t phase_offset_R = 0;
+
+
+
+// 其它在日志/蓝牙中被引用的占位
+float  S_torque_command_left  = 0.0f;
+float  S_torque_command_right = 0.0f;
+float  gait_freq = 0;
+
+volatile float  torque_rate   = 150.0f;  // Nm/s
+float  max_torque_cfg = 0.0f; 
+static uint8_t  gait_inited = 0;
+
+// 门函数/节律参数（来自 BLE）
+volatile float gate_k = 1.0f;
+volatile float gate_p_on = 2.5f;
+volatile uint16_t gate_lead_ms = 0;
+// ---- Gate 输入预测需要的状态（每腿各一个）----
+static float xL_prev = 0.0f;
+static float xR_prev = 0.0f;
+float M1_prev = 0.0f, M2_prev = 0.0f;
+
+/******************** 时间变量 ********************/
+unsigned long t_0 = 0;
+unsigned long current_time = 0;
+unsigned long previous_time = 0;        // 控制循环节拍
+unsigned long previous_time_ble = 0;    // BLE 发送节拍
+
+
+
+
+volatile float lead_frac         = 0.06f;  
+// 门控提前比例: lead_ms = lead_frac * T_gait_ms
+// 你现在把 lead_frac 设成了 60.0f。如果你希望“6% 的周期”，那它应该是 0.06f
+
+/******************** 前置声明 ********************/
+void initial_CAN();
+void initial_Sig_motor();         // 这里给出一个“空实现”，防止链接错误
+void receive_tm_feedback();
+void Receive_ble_Data();
+void Transmit_ble_Data();
+
+/******************** setup ********************/
+void setup() {
+  delay(3000);
+
+  Serial.begin(115200);
+  while (!Serial && millis() < 2000) {}
+
+  // BLE 串口
+  Serial5.begin(115200);
+  Serial5.setTimeout(5);
+
+  // 你自有的串口通讯初始化
+  Serial_Com.INIT();
+  delay(300);
+
+  // 缓存清零
+  memset(RLTx_delay,   0, sizeof(RLTx_delay));
+  memset(torque_delay, 0, sizeof(torque_delay));
+
+  // CAN 初始化
+  initial_CAN();
+  Serial.println("[OK] CAN bus setup");
+
+  // IMU 初始化
+  imu.INIT();
+  delay(2000);
+  imu.INIT_MEAN();        // 自动零偏
+  Serial.println("[OK] IMU setup done");
+  imu_init_ok = 1;
+
+  // 电机初始化（占位函数，确保存在；具体初始化放你自己的库里）
+  initial_Sig_motor();
+  Serial.println("[OK] T-Motor init done");
+
+  // SD 日志
+  if (logger.begin()) {
+    Serial.print(F("SD Logging file: "));
+    Serial.println(logger.filename());
+    logger.println(F(
+      "Time_ms,imu_RTx,imu_LTx,imu_1_left_shaking,imu_2_right_shaking,imu_3_left_foot,imu_4_right_foot,"
+      "RLTx_delay,torque_delay,tau_raw_L,tau_raw_R,"
+      "S_torque_command_left,S_torque_command_right,M1_torque_command,M2_torque_command,Rescaling_gain,"
+      "imu_Rvel,imu_Lvel,freq_avg,"
+      "extra1,extra2,extra3,extra4,extra5"   // 预留列
+    ));
+    logger.flush();
+  } else {
+    Serial.println(F("SD card init or file create failed!"));
+  }
+
+  t_0 = micros();
+}
+
+// 0.5*(tanh(k*(x - p_on)) + 1)  带阈值的软门
+inline float smooth_gate_p(float x, float k, float p_on){
+  return 0.5f * (tanhf(k * (x - p_on)) + 1.0f);
+}
+// 一阶线性预测：用当前斜率估计 lead_s 后的 x
+inline float lead_predict(float x, float x_prev, float lead_ms, float Ts){
+  const float lead_s = 0.001f * lead_ms;      // ms -> s
+  float dx = (x - x_prev) / Ts;               // 斜率
+
+  // —— 极简防抖：斜率限幅（先给保守值，后面再调）——
+  const float DX_MAX = 200.0f;                // 依据你 x 的量级微调
+  if (dx >  DX_MAX) dx =  DX_MAX;
+  if (dx < -DX_MAX) dx = -DX_MAX;
+
+  return x + lead_s * dx;
+}
+inline float slew(float target, float prev, float rate, float Ts){
+  float diff = target - prev, maxDiff = rate * Ts;
+  if (fabs(diff) > maxDiff) target = prev + copysignf(maxDiff, diff);
+  return target;
+}
+inline float clip_torque(float t){
+  float max_abs = fabsf(max_torque_cfg);              // 允许 GUI 传 负数也能容错成绝对值
+  return (t >  max_abs) ?  max_abs :
+         (t < -max_abs) ? -max_abs : t;
+}
+
+
+
+/******************** loop ********************/
+void loop() {
+  imu.READ();
+  Serial_Com.READ2();
+  current_time = micros();
+  const float Ts = (float)Tinterval_ctrl_micros / 1e6f;  // 控制周期 (s)
+
+  // Serial.printf("RTx=%.2f° LTx=%.2f°\r\n", imu.RTx, imu.LTx);
+ // === 简单失效/恢复判定 ===
+  if (fabs(imu.RTx) > 80.0f || fabs(imu.LTx) > 80.0f) {
+    if (imu_init_ok) {
+      Serial.println("[WARN] IMU角度超过 ±80°，关闭辅助");
+    }
+    imu_init_ok = 0;
+  } else {
+    if (!imu_init_ok) {
+      Serial.println("[OK] IMU角度回到安全范围，恢复辅助");
+    }
+    imu_init_ok = 1;
+  }
+  // —— 控制频率节拍（例如 100Hz）——
+  if (current_time - previous_time >= Tinterval_ctrl_micros) {
+    previous_time = current_time;
+    // 1) 接收 CAN 回包，刷新电机反馈
+    receive_tm_feedback();
+
+    // 2) 接收 BLE 下发（非阻塞，随时吸收）
+    Receive_ble_Data();
+    RLTx = imu.RTx - imu.LTx;
+    LTx_filtered_last = LTx_filtered;
+    LTx_filtered      = 0.9f * LTx_filtered_last + 0.1f * imu.LTx;
+    RTx_filtered_last = RTx_filtered;
+    RTx_filtered      = 0.9f * RTx_filtered_last + 0.1f * imu.RTx;
+    RLTx_filtered = RTx_filtered - LTx_filtered;
+    /************ 更新步态周期与初始化状态 ************/
+    static float RL_prev = 0.0f;
+    static uint32_t t_last_cross = 0;
+
+    const float RL_HYST_DEG = 3.0f;   // 跨零滞回阈值 ±3°
+    const float TGAIT_MIN_MS = 350.0f;
+    const float TGAIT_MAX_MS = 1800.0f;
+    const float TGAIT_SMOOTH_A = 0.35f;  // 平滑系数
+
+    // 检测负->正跨越
+    if (RL_prev <= -RL_HYST_DEG && RLTx_filtered >= RL_HYST_DEG) {
+      uint32_t now_ms = current_time / 1000UL;
+
+      if (t_last_cross > 0) {
+        float dt = (float)(now_ms - t_last_cross);
+        if (dt >= TGAIT_MIN_MS && dt <= TGAIT_MAX_MS) {
+          gait_inited = 1;  // ✅ 标记已检测到步态
+          // 指数平滑周期
+        }
+      }
+      t_last_cross = now_ms;
+    }
+    /************ 更新步态周期与初始化状态 ************/
+
+
+    RLTx_delay[doi] = RLTx_filtered;
+    gait_freq = estimateFreqFromRLTx(RLTx_filtered, current_time);
+
+// ################################
+    int Assist_delay_dynamic = Assist_delay_gain;  // 基础值来自 GUI
+    const float BASE_FREQ = 0.7f;      // 基准步频 (Hz)
+    const int   BASE_DELAY = Assist_delay_gain;  // 当前 GUI 设置对应 0.7Hz 时的基准
+    if (gait_freq > BASE_FREQ) {
+      Assist_delay_dynamic = (int)(BASE_DELAY * (BASE_FREQ / gait_freq));
+      if (Assist_delay_dynamic < 5) Assist_delay_dynamic = 5;   // 最小延迟样本保护
+    }
+    delayindex = doi - Assist_delay_dynamic;
+    if (delayindex < 0)              delayindex += 100;
+    else if (delayindex >= 100)      delayindex -= 100;
+    // === 各腿相位偏移（可保留，默认0不影响）===
+    int idx_L = (delayindex + phase_offset_L + 100) % 100;
+    int idx_R = (delayindex + phase_offset_R + 100) % 100;
+    // === 推进缓冲指针 ===
+    doi = (doi + 1) % 100;
+
+    /* ---------- 原始对称扭矩（极简版） ---------- */
+    const float phL = RLTx_delay[idx_L];
+    const float phR = RLTx_delay[idx_R];
+
+    float tau_raw_L = 0.0f;
+    float tau_raw_R = 0.0f;
+
+    // 左腿（RLTx>=0 表示右腿伸展、左腿屈曲 → 取负号）
+    if (fabsf(phL) <= 120.0f)
+        tau_raw_L = (phL >= 0.0f ? -1.0f : +1.0f) * phL;
+
+    // 右腿（RLTx>=0 表示右腿伸展 → 取正号）
+    if (fabsf(phR) <= 120.0f)
+        tau_raw_R = (phR >= 0.0f ? +1.0f : -1.0f) * phR;
+
+    /* --- 每腿功率门控输入 --- */
+    // 注意：右腿速度取负
+    RLTx = imu.RTx - imu.LTx;
+    LTx_filtered_last = LTx_filtered;
+    LTx_filtered      = 0.9f * LTx_filtered_last + 0.1f * imu.LTx;
+    RTx_filtered_last = RTx_filtered;
+    RTx_filtered      = 0.9f * RTx_filtered_last + 0.1f * imu.RTx;
+    RLTx_filtered = RTx_filtered - LTx_filtered;
+
+    /* --- 角速度(°/s) ---> rad/s 更物理，不过比例因子无关宏旨 --- 而且不能用imu读取的！！*/
+    const float LTx_vel = (LTx_filtered - LTx_filtered_last) * (PI/180.0f) / Ts;
+    const float RTx_vel = (RTx_filtered - RTx_filtered_last) * (PI/180.0f) / Ts;
+    
+    const float xL_raw = tau_raw_L * LTx_vel;
+    const float xR_raw = tau_raw_R * (-RTx_vel);
+
+
+    /********* 功率门控：仅用 lead_frac * T_gait_ms，去掉 gate_lead_ms/leadms *********/
+
+    // 1) 计算门控超前时间（ms）
+    //    - gait 已初始化：lead_ms = lead_frac * T_gait_ms
+    //    - 未初始化：用一个保底 35ms（可按需改）
+    //    - 做基本夹紧，避免极端
+    float lead_ms = 35.0f;  // fallback
+    if (gait_inited && gait_freq > 0.01f) {
+      float T_gait_ms = 1000.0f / gait_freq;        // Hz → ms
+      lead_ms = lead_frac * T_gait_ms;               // 例如 0.06 * 周期
+    }
+    if (lead_ms < 5.0f)   lead_ms = 5.0f;
+    if (lead_ms > 120.0f) lead_ms = 120.0f;
+
+    // 2) 线性前视预测（基于斜率）
+    const float xL_pred = lead_predict(xL_raw, xL_prev, lead_ms, Ts);
+    const float xR_pred = lead_predict(xR_raw, xR_prev, lead_ms, Ts);
+    xL_prev = xL_raw;   // 记住本帧 raw，下一帧当作“上一帧”
+    xR_prev = xR_raw;
+
+    // 3) 平滑门控（阈值在 gate_p_on，斜率由 gate_k）
+    const float gate_L = smooth_gate_p(xL_prev, gate_k, gate_p_on);
+    const float gate_R = smooth_gate_p(xR_prev, gate_k, gate_p_on);
+
+    // 4) 门后“原始”扭矩（此处仍不施加任何增益，保持线性）
+    //    这里的 tau_raw_* 是你上一步“对称扭矩（极简版）”算出来的
+    float tau_gate_L = tau_raw_L * gate_L;
+    float tau_gate_R = tau_raw_R * gate_R;
+
+    // 5) 一阶低通
+    tau_cmd_L_filt = 0.85f * tau_cmd_L_filt + (1.0f - 0.85f) * tau_gate_L;
+    tau_cmd_R_filt = 0.85f * tau_cmd_R_filt + (1.0f - 0.85f) * tau_gate_R;
+
+    // 6) 输出给下游（后面再做增益、slew、饱和、下发）
+    S_torque_command_left  = tau_cmd_L_filt/5;
+    S_torque_command_right = tau_cmd_R_filt/5;
+
+    M1_torque_command = S_torque_command_right * r_ctl_dir;
+    M2_torque_command = S_torque_command_left  * l_ctl_dir;
+    M1_torque_command = slew(M1_torque_command, M1_prev, torque_rate, Ts);
+    M2_torque_command = slew(M2_torque_command, M2_prev, torque_rate, Ts);
+    M1_prev = M1_torque_command;
+    M2_prev = M2_torque_command;
+
+    /* --- 饱和 --- */
+    M1_torque_command = clip_torque(M1_torque_command);
+    M2_torque_command = clip_torque(M2_torque_command);
+
+
+    // if (!imu_init_ok) {
+    //   M1_torque_command = 0;
+    //   M2_torque_command = 0;
+    // }
+                                                        /* aaaaaaaaa */
+
+
+    // 3) TODO: 在这里放入你的“算法/控制器”计算，写入 M1_torque_command / M2_torque_command
+    //    —— 当前阶段我们不做任何控制：保持命令=0 或者来自上位机的占位值 ——
+
+    // 4) 下发电机命令（MIT/力矩等，按你库的 send_cmd 接口）
+    sig_m1.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, (float)M1_torque_command);
+    sig_m2.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, (float)M2_torque_command);
+
+    // 5) 记录（可扩展）：与你给的“可扩展 SD 打印”一致
+    if (logger.isOpen()) {
+      // 1) time (ms)
+      logger.print(current_time / 1000UL); logger.print(',');
+
+      // 2) floats，保留4位小数（按你原始列）
+      logger.print(imu.RTx, 4);                logger.print(',');
+      logger.print(imu.LTx, 4);                logger.print(',');
+      logger.print(imu.TX1, 4);                logger.print(',');
+      logger.print(imu.TX2, 4);                logger.print(',');
+      logger.print(imu.TX3, 4);                logger.print(',');
+      logger.print(imu.TX4, 4);                logger.print(',');
+      logger.print(RLTx_delay[doi], 4);        logger.print(',');
+      logger.print(torque_delay[doi], 4);      logger.print(',');
+      logger.print(tau_raw_L, 4);              logger.print(',');
+      logger.print(tau_raw_R, 4);              logger.print(',');
+      logger.print(S_torque_command_left, 4);  logger.print(',');
+      logger.print(S_torque_command_right, 4); logger.print(',');
+      logger.print(M1_torque_command, 4);      logger.print(',');
+      logger.print(M2_torque_command, 4);      logger.print(',');
+      logger.print(Rescaling_gain, 4);         logger.print(',');
+      logger.print(imu.RTAVx, 4);              logger.print(',');
+      logger.print(imu.LTAVx, 4);              logger.print(',');
+      logger.print(gait_freq, 4);               logger.print(',');
+      logger.print(0.0f, 4);                   logger.print(',');
+      logger.print(0.0f, 4);                   logger.print(',');
+      logger.print(0.0f, 4);                   logger.print(',');
+      logger.print(0.0f, 4);                   logger.print(',');
+      logger.print(0.0f, 4);
+      logger.println();
+      static int log_flush_count = 0;
+      if (++log_flush_count >= 10) {   // 每10行 flush 一次
+        logger.flush();
+        log_flush_count = 0;
+      }
+    }
+  }
+
+  if (current_time - previous_time_ble >= Tinterval_ble_micros) {
+    previous_time_ble = current_time;
+    Transmit_ble_Data();
+  }
+
+
+
+  
+  // === 10 Hz 串口打印 ===
+  if (current_time - prev_print_us >= PRINT_INTERVAL_US) {
+    prev_print_us = current_time;
+
+    // 这里如果你有 smooth_gate(...) 就直接用；没有就先直接打印原值或留 0
+    #if DEBUG_PRINT
+    Serial.printf("RTx=%.2f°  LTx=%.2f°  |  fR=%.2fHz  fL=%.2fHz  avg=%.2fHz\r\n",
+      imu.RTx, imu.LTx,
+      RLTx_filtered, RLTx_filtered, gait_freq);
+    // Serial.printf("fR=%.2fHz  fL=%.2fHz  avg=%.2fHz  |  ωL=%.2frad/s  ωR=%.2frad/s  |  τL=%.2f  τR=%.2f\r\n",
+    //   freq_R, freq_L, freq_avg,
+    //   velL_rad, velR_rad,
+    //   M1_torque_command, M2_torque_command);
+    // Serial.printf("Rescale=%.2f  Flex=%.2f  Ext=%.2f  |  CmdM1=%.2f  CmdM2=%.2f  |  Delay=%.1fms\r\n",
+    //   Rescaling_gain, Flex_Assist_gain, Ext_Assist_gain,
+    //   M1_torque_command, M2_torque_command,
+    //   Assist_delay_gain);
+    #endif
+  }
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+float estimateFreqFromRLTx(float signal, unsigned long nowMicros) {
+  // 参数可调
+  const float HYST_POS = +2.0f;        // 上阈值 (+2°)
+  const float HYST_NEG = -2.0f;        // 下阈值 (-2°)
+  const unsigned long MIN_DT_US = 250000;   // 最短周期 0.25s → 最大 4Hz
+  const unsigned long MAX_DT_US = 2000000;  // 最长周期 2.0s → 最小 0.5Hz
+
+  // 内部状态
+  static bool armed = false;             
+  static unsigned long lastCross = 0;
+  static float freqHz = 0.0f;
+
+  // 1️⃣ 当信号跌到负区时武装
+  if (!armed && signal <= HYST_NEG) {
+    armed = true;
+  }
+
+  // 2️⃣ 从负区上升到正区时触发一次周期测量
+  if (armed && signal >= HYST_POS) {
+    unsigned long dt = nowMicros - lastCross;
+
+    if (lastCross > 0 && dt >= MIN_DT_US && dt <= MAX_DT_US) {
+      freqHz = 1.0e6f / (float)dt;
+    }
+
+    lastCross = nowMicros;
+    armed = false;  // 等待下一个下降→上升
+  }
+
+  return freqHz;
+}
+
+
+
+
+
+// 永远不会动的实现##############################################
+
+
+
+void initial_CAN() {
+  Can3.begin();
+  Can3.setBaudRate(1000000);
+  delay(400);
+  Serial.println("CAN bus setup done...");
+  delay(200);
+}
+
+void initial_Sig_motor() {
+  sig_m1.enter_control_mode();
+  delay(50);
+  sig_m2.enter_control_mode();
+  delay(50);
+  sig_m1.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+  sig_m2.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+  uint32_t t0 = millis();
+  while (millis() - t0 < 500) {
+    CAN_message_t mr;
+    while (Can3.read(mr)) {
+      sig_m1.unpack_reply(mr);
+      sig_m2.unpack_reply(mr);
+    }
+  }
+  initial_pos_1 = sig_m1.pos;
+  initial_pos_2 = sig_m2.pos;
+  M1_torque_command = 0.0;
+  M2_torque_command = 0.0;
+
+  Serial.println("tmotor torque-only (t_ff) path ready.");
+}
+
+
+void receive_tm_feedback() {
+  CAN_message_t mr;
+  while (Can3.read(mr)) {
+    sig_m1.unpack_reply(mr);
+    sig_m2.unpack_reply(mr);
+  }
+  // 同步实测扭矩（Nm）
+  M1_torque_meas = sig_m1.torque;
+  M2_torque_meas = sig_m2.torque;
+}
+
+/******************** BLE：接收 ********************/
+void Receive_ble_Data() {
+  static uint8_t hdr[3] = {0};
+
+  while (Serial5.available()) {
+    // 帧头 0xA5 0x5A 0x14
+    hdr[0] = hdr[1];
+    hdr[1] = hdr[2];
+    hdr[2] = Serial5.read();
+    if (!(hdr[0]==165 && hdr[1]==90 && hdr[2]==20)) continue;
+
+    if (Serial5.available() < 17) return;   // 不够一帧，不阻塞等待
+    Serial5.readBytes(data_rs232_rx, 17);
+
+    // 参数解包（与你一致）
+    Rescaling_gain    = int16_t(data_rs232_rx[0] | data_rs232_rx[1] << 8) / 100.0f;
+    Flex_Assist_gain  = int16_t(data_rs232_rx[2] | data_rs232_rx[3] << 8) / 100.0f;
+    Ext_Assist_gain   = int16_t(data_rs232_rx[4] | data_rs232_rx[5] << 8) / 100.0f;
+    Rescaling_gain    = constrain(Rescaling_gain,    0.0f, 10.0f);
+    Flex_Assist_gain  = constrain(Flex_Assist_gain,  0.0f, 10.0f);
+    Ext_Assist_gain   = constrain(Ext_Assist_gain,   0.0f, 10.0f);
+
+    Assist_delay_gain = data_rs232_rx[6];
+    if (Assist_delay_gain > 99) Assist_delay_gain = 99;
+
+    phase_offset_L = int8_t(data_rs232_rx[7]);
+    phase_offset_R = int8_t(data_rs232_rx[8]);
+    (void)phase_offset_L; (void)phase_offset_R; // 先不使用，避免未使用警告
+
+    uint8_t leadms = data_rs232_rx[13];
+
+    int16_t k100   = int16_t(data_rs232_rx[9]  | data_rs232_rx[10] << 8);
+    int16_t pon100 = int16_t(data_rs232_rx[11] | data_rs232_rx[12] << 8);
+    gate_k        = constrain(k100   / 100.0f, 0.1f, 20.0f);
+    gate_p_on     = pon100 / 100.0f;
+    gate_lead_ms  = (leadms > 200) ? 200 : leadms;
+
+    int16_t mt100 = int16_t(data_rs232_rx[14] | data_rs232_rx[15] << 8);
+    max_torque_cfg = constrain(mt100 / 100.0f, 2.0f, 15.0f);
+  }
+}
+
+/******************** BLE：发送（与你一致） ********************/
+void Transmit_ble_Data() {
+  // 这里用 millis 作为时间基准（0.01s 精度）
+  double t = millis() / 1000.0;
+  int t_teensy = (int)(t * 100);
+
+  int L_leg_IMU_angle = (int)(imu.LTx * 100);
+  int R_leg_IMU_angle = (int)(imu.RTx * 100);
+  int L_motor_torque  = (int)(sig_m1.torque * 100);
+  int R_motor_torque  = (int)(sig_m2.torque * 100);
+  int L_motor_torque_command = (int)(M1_torque_command * 100);
+  int R_motor_torque_command = (int)(M2_torque_command * 100);
+
+  data_ble[0]  = 165;
+  data_ble[1]  = 90;
+  data_ble[2]  = datalength_ble;
+  data_ble[3]  = t_teensy;
+  data_ble[4]  = t_teensy >> 8;
+  data_ble[5]  = L_leg_IMU_angle;
+  data_ble[6]  = L_leg_IMU_angle >> 8;
+  data_ble[7]  = R_leg_IMU_angle;
+  data_ble[8]  = R_leg_IMU_angle >> 8;
+  data_ble[9]  = L_motor_torque;
+  data_ble[10] = L_motor_torque >> 8;
+  data_ble[11] = R_motor_torque;
+  data_ble[12] = R_motor_torque >> 8;
+  data_ble[13] = L_motor_torque_command;
+  data_ble[14] = L_motor_torque_command >> 8;
+  data_ble[15] = R_motor_torque_command;
+  data_ble[16] = R_motor_torque_command >> 8;
+
+  // 新增：IMU 初始化状态 + 当前 max_torque
+  data_ble[17] = imu_init_ok;   // 0 or 1
+
+  int16_t mt100 = (int16_t)(max_torque_cfg * 100.0f);
+  data_ble[18] = (uint8_t)(mt100 & 0xFF);
+  data_ble[19] = (uint8_t)((mt100 >> 8) & 0xFF);
+
+  // 占位
+  for (int i = 20; i <= 28; ++i) data_ble[i] = 0;
+
+  Serial5.write((uint8_t*)data_ble, (size_t)datalength_ble);
+}
+
+/******************** 其它小工具（保留你的签名） ********************/
+double derivative(double dt, double derivative_prev[], double *actual_in_ptr, double *prev_in_ptr){
+  int i;
+  double diff = 0.0, diff_sum = 0.0;
+  if (dt != 0.0){
+    for (i = 0; i < 3; i++){
+      diff_sum += derivative_prev[i];
+    }
+    diff = (diff_sum + (*actual_in_ptr - *prev_in_ptr) / dt) / (i + 1);
+  } else {
+    diff = derivative_prev[3];
+  }
+  return diff;
+}
