@@ -14,6 +14,12 @@
 #ifndef DEBUG_PRINT
 #define DEBUG_PRINT 1   // 改成 0 关闭所有调试打印
 #endif
+#define GUI_WRITE_ENABLE   1   // 把它改成0就是锁死
+// --- LOGTAG 全局变量 ---
+static char logtag[11] = {0};       // 最多10字符 + '\0'
+static bool logtag_valid = false;   // 是否有标签可写入
+static bool logtag_persist = false; // 是否持续打印
+
 
 const unsigned long PRINT_INTERVAL_US = 100000; // 10 Hz
 static unsigned long prev_print_us = 0;
@@ -89,16 +95,6 @@ double RLTx              = 0;
 double RLTx_filtered     = 0;
 
 
-// GUI/参数（蓝牙下发写入）
-double Rescaling_gain    = 5.0;
-double Flex_Assist_gain  = 2.5;
-double Ext_Assist_gain   = 2.5;
-double Assist_delay_gain = 0.0;
-/* ======= ① 新增全局参数 ======= */
-int8_t phase_offset_L = 0;   // << 你可以开 BLE 命令实时改
-int8_t phase_offset_R = 0;
-
-
 
 // 其它在日志/蓝牙中被引用的占位
 float  S_torque_command_left  = 0.0f;
@@ -109,10 +105,7 @@ volatile float  torque_rate   = 150.0f;  // Nm/s
 float  max_torque_cfg = 0.0f; 
 static uint8_t  gait_inited = 0;
 
-// 门函数/节律参数（来自 BLE）
-volatile float gate_k = 1.0f;
-volatile float gate_p_on = 2.5f;
-volatile uint16_t gate_lead_ms = 0;
+
 // ---- Gate 输入预测需要的状态（每腿各一个）----
 static float xL_prev = 0.0f;
 static float xR_prev = 0.0f;
@@ -215,12 +208,24 @@ inline float clip_torque(float t){
   return (t >  max_abs) ?  max_abs :
          (t < -max_abs) ? -max_abs : t;
 }
+
+// 限幅到 [lo, hi]
+static inline double clampf(float x, float lo, float hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+// 辅助：把两个字节拼成 int16_t
+static inline int16_t rd_i16(const uint8_t *buf, int idx) {
+  return (int16_t)( buf[idx] | (buf[idx+1] << 8) );
+}
+
+
+
 int8_t flex_sign_L = -1; // 左腿屈相抓负半波
 int8_t flex_sign_R = +1; // 右腿屈相抓正半波
-// === Extension 相位延迟（占整周期的比例 0~1，可从 BLE 改）===
-volatile float ext_phase_frac_L = 0.3f;  // 左腿：延迟=0.35*Tgait
-volatile float ext_phase_frac_R = 0.3f;  // 右腿：延迟=0.35*Tgait
-volatile float lead_frac         = 0.06f;  
+
 // 门控提前比例: lead_ms = lead_frac * T_gait_ms
 // 你现在把 lead_frac 设成了 60.0f。如果你希望“6% 的周期”，那它应该是 0.06f
 // ===== 环形缓冲（仅存“屈相(负值)”）=====
@@ -228,11 +233,34 @@ volatile float lead_frac         = 0.06f;
 static float flexL_hist[EXT_BUF_LEN] = {0.0f};
 static float flexR_hist[EXT_BUF_LEN] = {0.0f};
 static int   ext_i = 0; // 写指针（随周期递增）
-// ===== Extension 复制/回放配置（按你要求的默认值）=====
-static const bool  use_ext_copy   = true;   // 开关
 
-static const float ext_gain       = 0.5f;   // 幅值增益
+
+
 /****************************************/
+
+/****************************************
+ * 控制参数（主控真正使用）
+ * 说明：这些值是控制逻辑读取的“真值”
+ ****************************************/
+// 这三个目前是占位/不使用，但我们仍然保持解析，方便协议对齐
+float Rescaling_gain    = 5.0f;
+float Flex_Assist_gain  = 2.5f;
+float Ext_Assist_gain   = 2.5f;
+float Assist_delay_gain = 0.0f;
+float scale_all         = 0.2f;
+
+int8_t phase_offset_L   = 0;
+int8_t phase_offset_R   = 0;
+
+float ext_gain          = 0.5f;
+float ext_phase_frac_L  = 0.3f;
+float ext_phase_frac_R  = 0.3f;
+float lead_frac         = 0.06f;
+float gate_k            = 1.0f;
+float gate_p_on         = 2.5f;
+
+// ===== Extension 复制/回放配置（按你要求的默认值，gui不修改）=====
+static const bool  use_ext_copy   = true;   // 开关
 volatile bool  ext_enable_L = true;        // 只在左腿复制 extension
 volatile bool  ext_enable_R = true;       // 右腿默认不复制
 /******************** loop ********************/
@@ -380,11 +408,11 @@ void loop() {
     tau_cmd_R_filt = 0.85f * tau_cmd_R_filt + (1.0f - 0.85f) * tau_gate_R;
 
     // 6) 输出给下游（后面再做增益、slew、饱和、下发）
-    S_torque_command_left  = tau_cmd_L_filt/5;
-    S_torque_command_right = tau_cmd_R_filt/5;
+    S_torque_command_left  = tau_cmd_L_filt* scale_all;
+    S_torque_command_right = tau_cmd_R_filt* scale_all;
 
-    float S_src_L = tau_cmd_L_filt/5;  // LPF 后
-    float S_src_R = tau_cmd_R_filt/5;
+    float S_src_L = tau_cmd_L_filt* scale_all;  // LPF 后
+    float S_src_R = tau_cmd_R_filt* scale_all;
 
     auto keep_if_flex = [](float S, int8_t sign){ return ((sign > 0) ? (S > 0.0f) : (S < 0.0f)) ? S : 0.0f; };
     float flexL_now = keep_if_flex(S_src_L, flex_sign_L);  // 例如 flex_sign_L=-1 代表“负值为屈”
@@ -395,8 +423,6 @@ void loop() {
     flexR_hist[w] = flexR_now;
 
 
-
-    float cycle_ms = 35.0f;  // fallback
     float T_gait_ms1 = 1000.0f / gait_freq;        // Hz → ms
 
     // —— 计算 extension 延迟时间（ms）= 百分比 × 当前周期 ——
@@ -466,10 +492,10 @@ void loop() {
     M2_torque_command = clip_torque(M2_torque_command);
 
 
-    // if (!imu_init_ok) {
-    //   M1_torque_command = 0;
-    //   M2_torque_command = 0;
-    // }
+    if (!imu_init_ok) {
+      M1_torque_command = 0;
+      M2_torque_command = 0;
+    }
                                                         /* aaaaaaaaa */
 
 
@@ -506,7 +532,17 @@ void loop() {
       logger.print(gait_freq, 4);               logger.print(',');
       logger.print(M1_prev, 4);                   logger.print(',');
       logger.print(M2_prev, 4);                   logger.print(',');
-      logger.print(0.0f, 4);                   logger.print(',');
+      if (logtag_valid) {
+        logger.print(logtag);
+        logger.print(',');
+        if (!logtag_persist) {
+          logtag_valid = false;  // 只打印一次则清掉
+        }
+      } else {
+        logger.print(0.0f, 4);
+        logger.print(',');
+      }
+      
       logger.print(0.0f, 4);                   logger.print(',');
       logger.print(0.0f, 4);
       logger.println();
@@ -535,10 +571,10 @@ void loop() {
     // Serial.printf("RTx=%.2f°  LTx=%.2f°  |  fR=%.2fHz  fL=%.2fHz  avg=%.2fHz\r\n",
     //   imu.RTx, imu.LTx,
     //   cycle_ms, ext_ms_L, ext_ms_R);
-    // Serial.printf("fR=%.2fHz  fL=%.2fHz  avg=%.2fHz  |  ωL=%.2frad/s  ωR=%.2frad/s  |  τL=%.2f  τR=%.2f\r\n",
-    //   freq_R, freq_L, freq_avg,
-    //   velL_rad, velR_rad,
-    //   M1_torque_command, M2_torque_command);
+    Serial.printf("fR=%.2fHz  fL=%.2fHz  avg=%.2fHz  |  ωL=%.2frad/s  ωR=%.2frad/s  |  τL=%.2f  τR=%.2f\r\n",
+      imu.RTx, imu.LTx, max_torque_cfg,
+      imu.RTx, imu.LTx,
+      M1_torque_command, M2_torque_command);
     // Serial.printf("Rescale=%.2f  Flex=%.2f  Ext=%.2f  |  CmdM1=%.2f  CmdM2=%.2f  |  Delay=%.1fms\r\n",
     //   Rescaling_gain, Flex_Assist_gain, Ext_Assist_gain,
     //   M1_torque_command, M2_torque_command,
@@ -651,89 +687,199 @@ void receive_tm_feedback() {
 }
 
 /******************** BLE：接收 ********************/
+/******************** BLE：接收（带占位、32字节帧） ********************/
 void Receive_ble_Data() {
   static uint8_t hdr[3] = {0};
 
   while (Serial5.available()) {
-    // 帧头 0xA5 0x5A 0x14 
+
+    // 1) 帧头滚动窗口，寻找 0xA5 0x5A <len>
     hdr[0] = hdr[1];
     hdr[1] = hdr[2];
     hdr[2] = Serial5.read();
-    if (!(hdr[0]==165 && hdr[1]==90 && hdr[2]==20)) continue;
 
-    if (Serial5.available() < 17) return;   // 不够一帧，不阻塞等待
-    Serial5.readBytes(data_rs232_rx, 17);
+    const uint8_t FRAME_LEN = 32;         // 整帧长度（含头）
+    const uint8_t PAYLOAD_LEN = FRAME_LEN - 3; // 去掉3字节头，剩余payload
+    if (!(hdr[0] == 0xA5 && hdr[1] == 0x5A && hdr[2] == FRAME_LEN)) {
+      continue;
+    }
 
-    // 参数解包（与你一致）
-    Rescaling_gain    = int16_t(data_rs232_rx[0] | data_rs232_rx[1] << 8) / 100.0f;
-    Flex_Assist_gain  = int16_t(data_rs232_rx[2] | data_rs232_rx[3] << 8) / 100.0f;
-    Ext_Assist_gain   = int16_t(data_rs232_rx[4] | data_rs232_rx[5] << 8) / 100.0f;
-    Rescaling_gain    = constrain(Rescaling_gain,    0.0f, 10.0f);
-    Flex_Assist_gain  = constrain(Flex_Assist_gain,  0.0f, 10.0f);
-    Ext_Assist_gain   = constrain(Ext_Assist_gain,   0.0f, 10.0f);
+    // 2) 确认串口里够一整帧payload
+    if (Serial5.available() < PAYLOAD_LEN) {
+      return; // 数据没全，不阻塞
+    }
 
-    Assist_delay_gain = data_rs232_rx[6];
-    if (Assist_delay_gain > 99) Assist_delay_gain = 99;
+    // 3) 读payload进 data_rs232_rx[0 .. PAYLOAD_LEN-1]
+    Serial5.readBytes((char*)data_rs232_rx, PAYLOAD_LEN);
 
-    phase_offset_L = int8_t(data_rs232_rx[7]);
-    phase_offset_R = int8_t(data_rs232_rx[8]);
-    (void)phase_offset_L; (void)phase_offset_R; // 先不使用，避免未使用警告
 
-    uint8_t leadms = data_rs232_rx[13];
+    // 在接收代码里加判断
+    if (data_rs232_rx[0] == 'L' && data_rs232_rx[1] == 'G') {
+      uint8_t n = data_rs232_rx[2];
+      if (n > 10) n = 10;
+      memset(logtag, 0, sizeof(logtag));
+      memcpy(logtag, &data_rs232_rx[3], n);
+      logtag_valid = true;
+      logtag_persist = (data_rs232_rx[13] & 0x01);
+    
+      Serial.print("LOGTAG received: ");
+      Serial.println(logtag);
+      return;  // 这帧是 LOGTAG，不走原有参数解析
+    }
+    
+    /****************************************
+     * 4) 解析 payload -> new_* 临时变量
+     *    映射规则见上表
+     ****************************************/
 
-    int16_t k100   = int16_t(data_rs232_rx[9]  | data_rs232_rx[10] << 8);
-    int16_t pon100 = int16_t(data_rs232_rx[11] | data_rs232_rx[12] << 8);
-    gate_k        = constrain(k100   / 100.0f, 0.1f, 20.0f);
-    gate_p_on     = pon100 / 100.0f;
-    gate_lead_ms  = (leadms > 200) ? 200 : leadms;
+    float new_Rescaling_gain    = rd_i16((uint8_t*)data_rs232_rx, 0)  / 100.0f;   // 占位
+    float new_Flex_Assist_gain  = rd_i16((uint8_t*)data_rs232_rx, 2)  / 100.0f;   // 占位
+    float new_Ext_Assist_gain   = rd_i16((uint8_t*)data_rs232_rx, 4)  / 100.0f;   // 占位
 
-    int16_t mt100 = int16_t(data_rs232_rx[14] | data_rs232_rx[15] << 8);
-    max_torque_cfg = constrain(mt100 / 100.0f, 2.0f, 15.0f);
+    float new_Assist_delay_gain = (float)((uint8_t)data_rs232_rx[6]);            // 0~99
+
+    int8_t new_phase_offset_L   = (int8_t)data_rs232_rx[7];                      // 占位
+    int8_t new_phase_offset_R   = (int8_t)data_rs232_rx[8];                      // 占位
+
+    float new_gate_k            = rd_i16((uint8_t*)data_rs232_rx,  9) / 100.0f;  // 0~10
+    float new_gate_p_on         = rd_i16((uint8_t*)data_rs232_rx, 11) / 100.0f;  // 0~10
+
+    float new_lead_frac         = rd_i16((uint8_t*)data_rs232_rx, 13) / 1000.0f; // 0~0.1
+
+    float new_ext_phase_frac_L  = rd_i16((uint8_t*)data_rs232_rx, 15) / 1000.0f; // 0~0.5
+    float new_ext_phase_frac_R  = rd_i16((uint8_t*)data_rs232_rx, 17) / 1000.0f; // 0~0.5
+
+    float new_ext_gain          = rd_i16((uint8_t*)data_rs232_rx, 19) / 100.0f;  // -3~3
+    float new_scale_all         = rd_i16((uint8_t*)data_rs232_rx, 21) / 100.0f;  // -1~1
+    float new_max_torque_cfg = rd_i16((uint8_t*)data_rs232_rx, 23) / 100.0f;  // ★ [23..24]
+
+    // bytes [23..28] （甚至 [23..PAYLOAD_LEN-1]）为占位/保留
+    // 将来可以在这里继续解析更多字段，比如 max_torque_cfg 等
+    // 现在我们就先忽略它们:
+    // int16_t future_param = rd_i16((uint8_t*)data_rs232_rx, 23) / 100.0f;  // 示例
+    // ...
+
+    /****************************************
+     * 5) 限幅保护
+     ****************************************/
+
+    new_Rescaling_gain    = clampf(new_Rescaling_gain,    0.0f, 10.0f);
+    new_Flex_Assist_gain  = clampf(new_Flex_Assist_gain,  0.0f, 10.0f);
+    new_Ext_Assist_gain   = clampf(new_Ext_Assist_gain,   0.0f, 10.0f);
+
+    new_Assist_delay_gain = clampf(new_Assist_delay_gain, 0.0f, 99.0f);
+
+    // 如果你想限制相位偏移，比如 [-90, 90]，可以在这里加
+    // new_phase_offset_L = (int8_t)constrain(new_phase_offset_L, -90, 90);
+    // new_phase_offset_R = (int8_t)constrain(new_phase_offset_R, -90, 90);
+
+    new_gate_k            = clampf(new_gate_k,            0.0f, 10.0f);
+    new_gate_p_on         = clampf(new_gate_p_on,         0.0f, 10.0f);
+
+    new_lead_frac         = clampf(new_lead_frac,         0.0f, 0.1f);
+    new_ext_phase_frac_L  = clampf(new_ext_phase_frac_L,  0.0f, 0.5f);
+    new_ext_phase_frac_R  = clampf(new_ext_phase_frac_R,  0.0f, 0.5f);
+
+    // 如果你只允许负向助力（不推反向），把上界改成 0.0f
+    new_ext_gain          = clampf(new_ext_gain,         -3.0f, 3.0f);
+    new_scale_all         = clampf(new_scale_all,        -1.0f, 1.0f);
+    new_max_torque_cfg = clampf(new_max_torque_cfg, 0.0f, 15.0f);
+
+    /****************************************
+     * 6) 根据开关, 决定是否写入全局控制变量
+     ****************************************/
+#if GUI_WRITE_ENABLE
+    Rescaling_gain    = new_Rescaling_gain;
+    Flex_Assist_gain  = new_Flex_Assist_gain;
+    Ext_Assist_gain   = new_Ext_Assist_gain;
+
+    Assist_delay_gain = new_Assist_delay_gain;
+    phase_offset_L    = new_phase_offset_L;
+    phase_offset_R    = new_phase_offset_R;
+
+    gate_k            = new_gate_k;
+    gate_p_on         = new_gate_p_on;
+
+    lead_frac         = new_lead_frac;
+    ext_phase_frac_L  = new_ext_phase_frac_L;
+    ext_phase_frac_R  = new_ext_phase_frac_R;
+
+    ext_gain          = new_ext_gain;
+    scale_all         = new_scale_all;
+    max_torque_cfg    = new_max_torque_cfg;
+#else
+    // LOCKED模式: 我们不更新全局参数
+    // 你可以在这里记录new_*用于debug (比如放到一个shadow_*里)
+#endif
   }
 }
 
 /******************** BLE：发送（与你一致） ********************/
 void Transmit_ble_Data() {
+  const uint8_t FRAME_LEN = 32;
   // 这里用 millis 作为时间基准（0.01s 精度）
-  double t = millis() / 1000.0;
-  int t_teensy = (int)(t * 100);
 
-  int L_leg_IMU_angle = (int)(imu.LTx * 100);
-  int R_leg_IMU_angle = (int)(imu.RTx * 100);
-  int L_motor_torque  = (int)(sig_m1.torque * 100);
-  int R_motor_torque  = (int)(sig_m2.torque * 100);
-  int L_motor_torque_command = (int)(M1_torque_command * 100);
-  int R_motor_torque_command = (int)(M2_torque_command * 100);
 
-  data_ble[0]  = 165;
-  data_ble[1]  = 90;
-  data_ble[2]  = datalength_ble;
-  data_ble[3]  = t_teensy;
-  data_ble[4]  = t_teensy >> 8;
-  data_ble[5]  = L_leg_IMU_angle;
-  data_ble[6]  = L_leg_IMU_angle >> 8;
-  data_ble[7]  = R_leg_IMU_angle;
-  data_ble[8]  = R_leg_IMU_angle >> 8;
-  data_ble[9]  = L_motor_torque;
-  data_ble[10] = L_motor_torque >> 8;
-  data_ble[11] = R_motor_torque;
-  data_ble[12] = R_motor_torque >> 8;
-  data_ble[13] = L_motor_torque_command;
-  data_ble[14] = L_motor_torque_command >> 8;
-  data_ble[15] = R_motor_torque_command;
-  data_ble[16] = R_motor_torque_command >> 8;
+  // 0) 时间戳：厘秒（0.01s）, 用 uint16_t 发送，小端；~655.35s回绕
+  uint16_t t_cs = (uint16_t)((millis() / 10) & 0xFFFF);
 
-  // 新增：IMU 初始化状态 + 当前 max_torque
-  data_ble[17] = imu_init_ok;   // 0 or 1
+  // 1) 量化为 int16 = 值 * 100（小端）
+  int16_t L_ang100   = (int16_t)roundf(imu.LTx * 100.0f);
+  int16_t R_ang100   = (int16_t)roundf(imu.RTx * 100.0f);
+  int16_t L_tau100   = (int16_t)roundf(sig_m1.torque * 100.0f);
+  int16_t R_tau100   = (int16_t)roundf(sig_m2.torque * 100.0f);
+  int16_t L_cmd100   = (int16_t)roundf(M1_torque_command * 100.0f);
+  int16_t R_cmd100   = (int16_t)roundf(M2_torque_command * 100.0f);
+  int16_t mt100 = (int16_t)roundf(max_torque_cfg * 100.0f);
 
-  int16_t mt100 = (int16_t)(max_torque_cfg * 100.0f);
+  // 新增：步态频率 Hz×100 → int16，小端；典型 0.5~2.5 Hz
+  extern float gait_freq; // 你在别处计算好的步频 [Hz]
+  int16_t gf100 = (int16_t)roundf(gait_freq * 100.0f);
+
+  // 2) 帧头
+  data_ble[0] = 0xA5;
+  data_ble[1] = 0x5A;
+  data_ble[2] = FRAME_LEN;
+
+  // 3) 载荷（从 index=3 开始，以下是小端）
+  data_ble[3]  = (uint8_t)(t_cs & 0xFF);
+  data_ble[4]  = (uint8_t)((t_cs >> 8) & 0xFF);
+
+  data_ble[5]  = (uint8_t)(L_ang100 & 0xFF);
+  data_ble[6]  = (uint8_t)((L_ang100 >> 8) & 0xFF);
+  data_ble[7]  = (uint8_t)(R_ang100 & 0xFF);
+  data_ble[8]  = (uint8_t)((R_ang100 >> 8) & 0xFF);
+
+  data_ble[9]  = (uint8_t)(L_tau100 & 0xFF);
+  data_ble[10] = (uint8_t)((L_tau100 >> 8) & 0xFF);
+  data_ble[11] = (uint8_t)(R_tau100 & 0xFF);
+  data_ble[12] = (uint8_t)((R_tau100 >> 8) & 0xFF);
+
+  data_ble[13] = (uint8_t)(L_cmd100 & 0xFF);
+  data_ble[14] = (uint8_t)((L_cmd100 >> 8) & 0xFF);
+  data_ble[15] = (uint8_t)(R_cmd100 & 0xFF);
+  data_ble[16] = (uint8_t)((R_cmd100 >> 8) & 0xFF);
+
+  // 4) IMU 初始化状态 + 当前 max_torque_cfg（Nm×100）——保持原位置
+  data_ble[17] = imu_init_ok ? 1 : 0;
+
   data_ble[18] = (uint8_t)(mt100 & 0xFF);
   data_ble[19] = (uint8_t)((mt100 >> 8) & 0xFF);
 
-  // 占位
-  for (int i = 20; i <= 28; ++i) data_ble[i] = 0;
+  // 5) 新增：gait_freq at payload[20..21]（即 data_ble[23..24]）
+  data_ble[20] = 0;  // payload[17] 仍空着（兼容你现有 GUI 的解析）
+  data_ble[21] = 0;  // payload[18] 仍空着
+  data_ble[22] = 0;  // payload[19] 仍空着
 
-  Serial5.write((uint8_t*)data_ble, (size_t)datalength_ble);
+  data_ble[23] = (uint8_t)(gf100 & 0xFF);
+  data_ble[24] = (uint8_t)((gf100 >> 8) & 0xFF);
+
+  // 6) 其余占位清零（payload[21+] -> data_ble[25..31]）
+  for (int i = 25; i <= 31; ++i) data_ble[i] = 0;
+
+  // 7) 发送
+  Serial5.write((uint8_t*)data_ble, (size_t)FRAME_LEN);
+
 }
 
 /******************** 其它小工具（保留你的签名） ********************/
