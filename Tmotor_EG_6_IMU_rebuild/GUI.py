@@ -86,7 +86,8 @@ class MainWindow(QWidget):
             # 表头：时间戳 + R数据 + L数据
             writer.writerow([
                 "timestamp",
-                "R_angle(θ)", "R_Torque Cmd", "R_Torque Est",
+                "R_angle(θ)", "R_Torque Cmd+"
+                "", "R_Torque Est",
                 "L_angle(θ)", "L_Torque Cmd", "L_Torque Est",
                 "Lθ Display", "Rθ Display", "Lτ Display", "Rτ Display"
             ])
@@ -153,7 +154,7 @@ class MainWindow(QWidget):
         self.sb_maxT.setDecimals(1)
         self.sb_maxT.setSingleStep(0.5)
         self.sb_maxT.setRange(0.0,15.0)   
-        self.sb_maxT.setValue(8.0)
+        self.sb_maxT.setValue(12.0)
         self.sb_maxT.setToolTip("Max torque saturation (Nm)")
         self.sb_maxT.valueChanged.connect(self._tx_params)
 

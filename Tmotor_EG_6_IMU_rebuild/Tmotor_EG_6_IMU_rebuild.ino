@@ -127,9 +127,7 @@ unsigned long previous_time_ble = 0;    // BLE 发送节拍
 
 
 
-volatile float lead_frac         = 0.06f;  
-// 门控提前比例: lead_ms = lead_frac * T_gait_ms
-// 你现在把 lead_frac 设成了 60.0f。如果你希望“6% 的周期”，那它应该是 0.06f
+
 
 /******************** 前置声明 ********************/
 void initial_CAN();
@@ -181,7 +179,7 @@ void setup() {
       "RLTx_delay,torque_delay,tau_raw_L,tau_raw_R,"
       "S_torque_command_left,S_torque_command_right,M1_torque_command,M2_torque_command,Rescaling_gain,"
       "imu_Rvel,imu_Lvel,freq_avg,"
-      "extra1,extra2,extra3,extra4,extra5"   // 预留列
+      "M1_prev_afterslew,M2_prev_afterslew,extra3,extra4,extra5"   // 预留列
     ));
     logger.flush();
   } else {
@@ -217,9 +215,26 @@ inline float clip_torque(float t){
   return (t >  max_abs) ?  max_abs :
          (t < -max_abs) ? -max_abs : t;
 }
+int8_t flex_sign_L = -1; // 左腿屈相抓负半波
+int8_t flex_sign_R = +1; // 右腿屈相抓正半波
+// === Extension 相位延迟（占整周期的比例 0~1，可从 BLE 改）===
+volatile float ext_phase_frac_L = 0.3f;  // 左腿：延迟=0.35*Tgait
+volatile float ext_phase_frac_R = 0.3f;  // 右腿：延迟=0.35*Tgait
+volatile float lead_frac         = 0.06f;  
+// 门控提前比例: lead_ms = lead_frac * T_gait_ms
+// 你现在把 lead_frac 设成了 60.0f。如果你希望“6% 的周期”，那它应该是 0.06f
+// ===== 环形缓冲（仅存“屈相(负值)”）=====
+#define EXT_BUF_LEN 400  // 足够覆盖更大的延迟（例如 Ts=10ms 时可覆盖4s）
+static float flexL_hist[EXT_BUF_LEN] = {0.0f};
+static float flexR_hist[EXT_BUF_LEN] = {0.0f};
+static int   ext_i = 0; // 写指针（随周期递增）
+// ===== Extension 复制/回放配置（按你要求的默认值）=====
+static const bool  use_ext_copy   = true;   // 开关
 
-
-
+static const float ext_gain       = 0.5f;   // 幅值增益
+/****************************************/
+volatile bool  ext_enable_L = true;        // 只在左腿复制 extension
+volatile bool  ext_enable_R = true;       // 右腿默认不复制
 /******************** loop ********************/
 void loop() {
   imu.READ();
@@ -368,6 +383,77 @@ void loop() {
     S_torque_command_left  = tau_cmd_L_filt/5;
     S_torque_command_right = tau_cmd_R_filt/5;
 
+    float S_src_L = tau_cmd_L_filt/5;  // LPF 后
+    float S_src_R = tau_cmd_R_filt/5;
+
+    auto keep_if_flex = [](float S, int8_t sign){ return ((sign > 0) ? (S > 0.0f) : (S < 0.0f)) ? S : 0.0f; };
+    float flexL_now = keep_if_flex(S_src_L, flex_sign_L);  // 例如 flex_sign_L=-1 代表“负值为屈”
+    float flexR_now = keep_if_flex(S_src_R, flex_sign_R);
+
+    int w = ext_i % EXT_BUF_LEN;
+    flexL_hist[w] = flexL_now;
+    flexR_hist[w] = flexR_now;
+
+
+
+    float cycle_ms = 35.0f;  // fallback
+    float T_gait_ms1 = 1000.0f / gait_freq;        // Hz → ms
+
+    // —— 计算 extension 延迟时间（ms）= 百分比 × 当前周期 ——
+    // 未估到步态时，退回到固定 ms（你原先的 ext_delay_ms）
+    float ext_ms_L = ext_phase_frac_L * T_gait_ms1;
+    float ext_ms_R = ext_phase_frac_R * T_gait_ms1;
+    // Serial.printf("RTx=%.2f°  LTx=%.2f°  |  fR=%.2fHz  fL=%.2fHz  avg=%.2fHz\r\n",
+    //   imu.RTx, imu.LTx,
+    //   T_gait_ms1, ext_ms_L, ext_ms_R);
+    // —— 安全夹紧（避免极端）——
+    auto clampf = [](float x, float a, float b){ return (x<a)?a:((x>b)?b:x); };
+    ext_ms_L = clampf(ext_ms_L, 30.0f, 1200.0f);
+    ext_ms_R = clampf(ext_ms_R, 30.0f, 1200.0f);
+
+    // —— ms → 样本数：N = round( ext_ms / Ts ) ——
+    // 注意 Ts 是“秒”，所以 / (1000*Ts)
+    int extN_L = (int)lrintf(ext_ms_L / (1000.0f * Ts));
+    int extN_R = (int)lrintf(ext_ms_R / (1000.0f * Ts));
+    if (extN_L >= EXT_BUF_LEN) extN_L = EXT_BUF_LEN - 1;
+    if (extN_R >= EXT_BUF_LEN) extN_R = EXT_BUF_LEN - 1;
+    if (extN_L < 1) extN_L = 1;
+    if (extN_R < 1) extN_R = 1;
+
+    // —— 回读延迟后的 flexion（复制成 extension = 取相反号 × 增益）——
+    int rL = ext_i - extN_L;
+    int rR = ext_i - extN_R;
+    // 正模
+    if (rL < 0) rL += ((-rL / EXT_BUF_LEN) + 1) * EXT_BUF_LEN;
+    if (rR < 0) rR += ((-rR / EXT_BUF_LEN) + 1) * EXT_BUF_LEN;
+    rL %= EXT_BUF_LEN;  rR %= EXT_BUF_LEN;
+
+    float S_L_ext = 0.0f, S_R_ext = 0.0f;
+    if (use_ext_copy) {
+      if (ext_enable_L) S_L_ext = -ext_gain * flexL_hist[rL];
+      if (ext_enable_R) S_R_ext = -ext_gain * flexR_hist[rR];
+    }
+
+
+
+    // —— 叠加，得到最终 S ——
+    //（这里保持你前面 S_src_* 的定义：LPF 后 or 门后）
+    S_torque_command_left  = S_src_L + S_L_ext;
+    S_torque_command_right = S_src_R + S_R_ext;
+    S_torque_command_left = gait_freq*1.2 * S_torque_command_left;
+    S_torque_command_right = gait_freq*1.2 * S_torque_command_right;
+    // 推进写指针
+    ext_i++;
+
+
+
+
+
+
+
+
+
+
     M1_torque_command = S_torque_command_right * r_ctl_dir;
     M2_torque_command = S_torque_command_left  * l_ctl_dir;
     M1_torque_command = slew(M1_torque_command, M1_prev, torque_rate, Ts);
@@ -418,8 +504,8 @@ void loop() {
       logger.print(imu.RTAVx, 4);              logger.print(',');
       logger.print(imu.LTAVx, 4);              logger.print(',');
       logger.print(gait_freq, 4);               logger.print(',');
-      logger.print(0.0f, 4);                   logger.print(',');
-      logger.print(0.0f, 4);                   logger.print(',');
+      logger.print(M1_prev, 4);                   logger.print(',');
+      logger.print(M2_prev, 4);                   logger.print(',');
       logger.print(0.0f, 4);                   logger.print(',');
       logger.print(0.0f, 4);                   logger.print(',');
       logger.print(0.0f, 4);
@@ -446,9 +532,9 @@ void loop() {
 
     // 这里如果你有 smooth_gate(...) 就直接用；没有就先直接打印原值或留 0
     #if DEBUG_PRINT
-    Serial.printf("RTx=%.2f°  LTx=%.2f°  |  fR=%.2fHz  fL=%.2fHz  avg=%.2fHz\r\n",
-      imu.RTx, imu.LTx,
-      RLTx_filtered, RLTx_filtered, gait_freq);
+    // Serial.printf("RTx=%.2f°  LTx=%.2f°  |  fR=%.2fHz  fL=%.2fHz  avg=%.2fHz\r\n",
+    //   imu.RTx, imu.LTx,
+    //   cycle_ms, ext_ms_L, ext_ms_R);
     // Serial.printf("fR=%.2fHz  fL=%.2fHz  avg=%.2fHz  |  ωL=%.2frad/s  ωR=%.2frad/s  |  τL=%.2f  τR=%.2f\r\n",
     //   freq_R, freq_L, freq_avg,
     //   velL_rad, velR_rad,
@@ -569,7 +655,7 @@ void Receive_ble_Data() {
   static uint8_t hdr[3] = {0};
 
   while (Serial5.available()) {
-    // 帧头 0xA5 0x5A 0x14
+    // 帧头 0xA5 0x5A 0x14 
     hdr[0] = hdr[1];
     hdr[1] = hdr[2];
     hdr[2] = Serial5.read();
