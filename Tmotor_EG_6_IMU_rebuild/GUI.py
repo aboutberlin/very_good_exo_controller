@@ -258,11 +258,123 @@ class MainWindow(QWidget):
 
         # 把整行 LogTag 放到 grid 的下一行，并让它“横跨所有列”
         grid.addLayout(logtag_row, base_row + 1, 0, 1, cols)
+
+        # ================== 这里是你要的新按钮 ==================
+        # 这个按钮的逻辑：每点一次，自动把 edt 里写成 "2mile" / "3mile" / "4mile"...
+        # 然后自动勾上 Persist，然后调你现成的 self._send_logtag()
+        self._next_mile_value = 2   # 起始就是你说的 2mile
+
+        auto_row = QHBoxLayout()
+        auto_row.setSpacing(8)
+
+        self.btn_auto_mile = QPushButton(f"AUTO MILE (next: {self._next_mile_value}mile)")
+        self.btn_auto_mile.setMinimumHeight(58)
+        self.btn_auto_mile.setCursor(Qt.PointingHandCursor)
+        self.btn_auto_mile.setStyleSheet("""
+            QPushButton {
+                background:#4caf50;
+                color:white;
+                font-size:20px;
+                font-weight:700;
+                padding:10px 16px;
+                border:none;
+                border-radius:14px;
+            }
+            QPushButton:hover { background:#43a047; }
+            QPushButton:pressed { background:#388e3c; }
+        """)
+        self.btn_auto_mile.clicked.connect(self._auto_cycle_mile)
+        auto_row.addWidget(self.btn_auto_mile)
+        auto_row.addStretch(1)
+
+        # 放在 LogTag 行的下面一行
+        grid.addLayout(auto_row, base_row + 2, 0, 1, cols)
+
         # 右侧图区域
         self.plot_layout = plots
         self.lbl_status = QLabel("Idle")
         self.lbl_status.setStyleSheet("color:#555; padding:4px 6px;")
         left.addWidget(self.lbl_status)
+        
+    def _auto_cycle_mile(self):
+        """
+        自动 mile 按钮的处理：
+        1. 把输入框内容设成当前要发的 mile，比如 "2mile"
+        2. 自动勾选 Persist（因为你说“要一直发送”）
+        3. 调用现有的 self._send_logtag()，走你原来的写入/发送流程
+        4. 把下一次要发的 mile +1，并更新按钮文案
+        """
+        text = f"{self._next_mile_value}mile"
+        self.edt_label.setText(text)
+
+        # 保证“一直发送”的体验和你上面那个一致
+        self.chk_label_persist.setChecked(True)
+
+        # 用你现有的发送逻辑；你原来是输完点按钮/回车，这里直接复用
+        self._send_logtag()
+
+        # 下次 +1
+        self._next_mile_value += 1
+        self.btn_auto_mile.setText(f"AUTO MILE (next: {self._next_mile_value}mile)")
+
+        # # ================== 在两行控件“下面”插入 LogTag 行 ==================
+        # # 计算下一个可用的“网格行”（注意我们每行占两行：标签行+控件行）
+        # rows_used = (len(labels) + cols - 1) // cols      # 逻辑行数（这里=2）
+        # base_row  = 2 * rows_used                         # 下一块内容从这里开始
+
+        # # 分隔线（可选）
+        # line = QFrame()
+        # line.setFrameShape(QFrame.HLine)
+        # line.setFrameShadow(QFrame.Sunken)
+        # grid.addWidget(line, base_row, 0, 1, cols)       # 跨满所有列
+
+        # # LogTag 行（更大更显眼）
+        # logtag_row = QHBoxLayout()
+        # logtag_row.setSpacing(8)
+
+        # lbl_logtag = QLabel("LogTag:")
+        # lbl_logtag.setStyleSheet("font-size:15px; font-weight:600;")
+        # logtag_row.addWidget(lbl_logtag)
+
+        # self.edt_label = QLineEdit()
+        # self.edt_label.setPlaceholderText("Enter log label (max 10 chars)")
+        # self.edt_label.setMaxLength(10)
+        # self.edt_label.setFixedWidth(240)
+        # self.edt_label.setMinimumHeight(34)
+        # self.edt_label.setStyleSheet("""
+        #     QLineEdit { font-size:16px; padding:6px 10px; border:2px solid #1976d2; border-radius:8px; }
+        #     QLineEdit:focus { border-color:#0d47a1; }
+        # """)
+        # self.edt_label.returnPressed.connect(self._send_logtag)
+        # logtag_row.addWidget(self.edt_label)
+
+        # self.chk_label_persist = QCheckBox("Persist")
+        # self.chk_label_persist.setStyleSheet("font-size:14px;")
+        # logtag_row.addWidget(self.chk_label_persist)
+
+        # btn_send_label = QPushButton("SEND LABEL")
+        # btn_send_label.clicked.connect(self._send_logtag)
+        # btn_send_label.setMinimumHeight(38)
+        # btn_send_label.setMinimumWidth(140)
+        # btn_send_label.setCursor(Qt.PointingHandCursor)
+        # btn_send_label.setStyleSheet("""
+        #     QPushButton {
+        #         background:#e53935; color:white; font-size:16px; font-weight:700;
+        #         padding:6px 14px; border:none; border-radius:10px;
+        #     }
+        #     QPushButton:hover { background:#c62828; }
+        #     QPushButton:pressed { background:#b71c1c; }
+        # """)
+        # logtag_row.addWidget(btn_send_label)
+        # logtag_row.addStretch(1)
+
+        # # 把整行 LogTag 放到 grid 的下一行，并让它“横跨所有列”
+        # grid.addLayout(logtag_row, base_row + 1, 0, 1, cols)
+        # # 右侧图区域
+        # self.plot_layout = plots
+        # self.lbl_status = QLabel("Idle")
+        # self.lbl_status.setStyleSheet("color:#555; padding:4px 6px;")
+        # left.addWidget(self.lbl_status)
 
 
 
