@@ -276,7 +276,7 @@ class MainWindow(QWidget):
                 color:white;
                 font-size:20px;
                 font-weight:700;
-                padding:10px 16px;
+                padding:200px 300px;
                 border:none;
                 border-radius:14px;
             }
@@ -289,6 +289,12 @@ class MainWindow(QWidget):
 
         # 放在 LogTag 行的下面一行
         grid.addLayout(auto_row, base_row + 2, 0, 1, cols)
+
+        # ==== ✅ 新增：SD 文件状态提示 ====
+        self.lbl_init_status = QLabel("SD log: FAIL")  # 默认就当没建成功
+        self.lbl_init_status.setStyleSheet("font-size:16px; color:#c62828; padding:6px;")
+        grid.addWidget(self.lbl_init_status, base_row + 3, 0, 1, cols)
+
 
         # 右侧图区域
         self.plot_layout = plots
@@ -648,7 +654,6 @@ class MainWindow(QWidget):
         if mt100_rx >= 32768:  # 二补码还原
             mt100_rx -= 65536
         maxT_rx = mt100_rx / 100.0
-
         if imu_ok_flag == 1:
             self.lbl_imu.setText("IMU init: OK")
             self.lbl_imu.setStyleSheet("color:#2e7d32")
@@ -656,6 +661,17 @@ class MainWindow(QWidget):
             self.lbl_imu.setText("IMU init: FAIL")
             self.lbl_imu.setStyleSheet("color:#c62828")
         self.lbl_maxt.setText(f"MaxT: {maxT_rx:.1f} Nm")
+         # === ✅ 新增：这是板子发来的“SD 文件创建是否成功” ===
+        # data_ble[20] → payload[17]
+        sd_ok_flag = payload[17]   # 0 = fail, 1 = success
+        if sd_ok_flag == 1:
+            self.lbl_init_status.setText("SD log: OK")
+            self.lbl_init_status.setStyleSheet("font-size:16px; color:#2e7d32; padding:6px;")
+        else:
+            # 保持红色，不用改也行，但写上更明确
+            self.lbl_init_status.setText("SD log: FAIL")
+            self.lbl_init_status.setStyleSheet("font-size:16px; color:#c62828; padding:6px;")
+
     # === 前14字节：7个 int16（t_cs, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d）===
         data = struct.unpack('<hhhhhhh', payload[:14])
         t_cs, L_angle_i, R_angle_i, L_tau_i, R_tau_i, L_tau_d_i, R_tau_d_i = data

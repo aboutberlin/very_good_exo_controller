@@ -35,7 +35,15 @@ SdLogger logger(BUILTIN_SDCARD, F("walking_log_"), F(".csv"));
 
 // SDIO 配置（如你后续需要直接用 SdFat，可继续用）
 #define SD_CONFIG SdioConfig(FIFO_SDIO)
-
+// 初始化状态 bitmask
+// bit0: CAN
+// bit1: IMU
+// bit2: SD logger
+// bit3: Motor
+// bit4: Serial_Com
+// bit5: BLE(Serial5)
+// 你后面还想加别的就继续往上加
+uint16_t g_init_status = 0;
 // 频率设置
 double cyclespersec_ctrl = 100;   // [Hz] 控制循环频率（CAN上限1000Hz）
 double cyclespersec_ble  = 20;    // [Hz] 蓝牙发送频率
@@ -172,13 +180,14 @@ void setup() {
       "RLTx_delay,torque_delay,tau_raw_L,tau_raw_R,"
       "S_torque_command_left,S_torque_command_right,M1_torque_command,M2_torque_command,Rescaling_gain,"
       "imu_Rvel,imu_Lvel,freq_avg,"
-      "M1_prev_afterslew,M2_prev_afterslew,extra3,extra4,extra5"   // 预留列
+      "M1_prev_afterslew,M2_prev_afterslew,extra3,extra4,extra5"
     ));
     logger.flush();
+    g_init_status = 1;
   } else {
     Serial.println(F("SD card init or file create failed!"));
+    // 这里就别置 INIT_SD 这位了
   }
-
   t_0 = micros();
 }
 
@@ -867,7 +876,7 @@ void Transmit_ble_Data() {
   data_ble[19] = (uint8_t)((mt100 >> 8) & 0xFF);
 
   // 5) 新增：gait_freq at payload[20..21]（即 data_ble[23..24]）
-  data_ble[20] = 0;  // payload[17] 仍空着（兼容你现有 GUI 的解析）
+  data_ble[20] = g_init_status & 0xFF;   // 只发低 8 位够用了
   data_ble[21] = 0;  // payload[18] 仍空着
   data_ble[22] = 0;  // payload[19] 仍空着
 
