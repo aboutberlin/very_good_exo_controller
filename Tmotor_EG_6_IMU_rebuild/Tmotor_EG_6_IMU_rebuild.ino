@@ -180,7 +180,7 @@ void setup() {
       "RLTx_delay,torque_delay,tau_raw_L,tau_raw_R,"
       "S_torque_command_left,S_torque_command_right,M1_torque_command,M2_torque_command,Rescaling_gain,"
       "imu_Rvel,imu_Lvel,freq_avg,"
-      "M1_prev_afterslew,M2_prev_afterslew,extra3,extra4,extra5"
+      "R_flexion,L_flexion,extra3,R_extension,L_extension"
     ));
     logger.flush();
     g_init_status = 1;
@@ -539,8 +539,8 @@ void loop() {
       logger.print(imu.RTAVx, 4);              logger.print(',');
       logger.print(imu.LTAVx, 4);              logger.print(',');
       logger.print(gait_freq, 4);               logger.print(',');
-      logger.print(M1_prev, 4);                   logger.print(',');
-      logger.print(M2_prev, 4);                   logger.print(',');
+      logger.print(S_src_R, 4);                   logger.print(',');
+      logger.print(S_src_L, 4);                   logger.print(',');
       if (logtag_valid) {
         logger.print(logtag);
         logger.print(',');
@@ -552,8 +552,8 @@ void loop() {
         logger.print(',');
       }
       
-      logger.print(0.0f, 4);                   logger.print(',');
-      logger.print(0.0f, 4);
+      logger.print(S_R_ext, 4);                   logger.print(',');
+      logger.print(S_L_ext, 4);
       logger.println();
       static int log_flush_count = 0;
       if (++log_flush_count >= 10) {   // 每10行 flush 一次
