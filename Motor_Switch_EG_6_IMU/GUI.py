@@ -55,7 +55,7 @@ class MainWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NYU Biro Lab Hip‑Exo Energy gate Controller v2.0")
+        self.setWindowTitle("Hip‑Exo Energy gate Controller v2.0")
 
         # === Serial setup vars ===
         self.ser = None
@@ -160,7 +160,7 @@ class MainWindow(QWidget):
         # self.sb_Flex_Assist_gain   = make_dspin(2.50, 0, 10, 0.10, 2, "Flex_Assist_gain (0..10)")
         # self.sb_Ext_Assist_gain    = make_dspin(2.50, 0, 10, 0.10, 2, "Ext_Assist_gain (0..10)")
         self.sb_gate_k             = make_dspin(1.00, 0, 10, 0.10, 2, "gate_k (0..10)")
-        self.sb_gate_p_on          = make_dspin(15, 0, 50, 1, 2, "gate_p_on (0..10)")
+        self.sb_gate_p_on          = make_dspin(8, 0, 50, 1, 2, "gate_p_on (0..10)")
         self.sb_scale_all          = make_dspin(0.20, -1.0, 1.0, 0.01, 2, "scale_all (-1..1)")
 # 新增：max_torque_cfg 旋钮（2.0~15.0 Nm）
         self.sb_max_torque_cfg = make_dspin(
@@ -269,7 +269,7 @@ class MainWindow(QWidget):
         auto_row = QHBoxLayout()
         auto_row.setSpacing(8)
 
-        self.btn_auto_mile = QPushButton(f"AUTO MILE (next: {self._next_mile_value}mile)")
+        self.btn_auto_mile = QPushButton(f"AUTO Label (next: {self._next_mile_value}ms)")
         self.btn_auto_mile.setMinimumHeight(58)
         self.btn_auto_mile.setCursor(Qt.PointingHandCursor)
         self.btn_auto_mile.setStyleSheet("""
@@ -427,7 +427,7 @@ class MainWindow(QWidget):
 
         # 下次 +1
         self._next_mile_value += 1
-        self.btn_auto_mile.setText(f"AUTO MILE (next: {self._next_mile_value}mile)")
+        self.btn_auto_mile.setText(f"AUTO Label (next: {self._next_mile_value}log)")
 
         # # ================== 在两行控件“下面”插入 LogTag 行 ==================
         # # 计算下一个可用的“网格行”（注意我们每行占两行：标签行+控件行）
