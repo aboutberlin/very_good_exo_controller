@@ -10,12 +10,28 @@
 #include "SdFat.h"
 #include "RingBuf.h"
 #include "sdlogger.h" 
-#ifndef DEBUG_PRINT
+
+#include "Sig_Motor_Control.h"
+// SIG 所需 ID（如果已定义可跳过）
+const uint16_t ID_M1_POSVEL = (0x002<<5) | 0x009; // 0x049
+const uint16_t ID_M1_TORQUE = (0x002<<5) | 0x01C; // 0x05C
+const uint16_t ID_M2_POSVEL = (0x001<<5) | 0x009; // 0x029
+const uint16_t ID_M2_TORQUE = (0x001<<5) | 0x01C; // 0x03C
+const uint16_t ID_M1_IQ = (0x002<<5) | 0x014; // 0x064
+const uint16_t ID_M2_IQ = (0x001<<5) | 0x014; // 0x034
+
+#define KT_1 0.67f
+#define KT_2 0.67f
+
+
+
+// ====== Motor brand switch (0 = SIG, 1 = TMOTOR) ======
+#define MOTOR_BRAND 0   
+
+#ifndef max_torque_cfg
 #define DEBUG_PRINT 1   // 改成 0 关闭所有调试打印
 #endif
 #define GUI_WRITE_ENABLE   1   // 把它改成0就是锁死
-
-#include "Motor_Control_Tmotor.h"
 // --- LOGTAG 全局变量 ---
 static char logtag[11] = {0};       // 最多10字符 + '\0'
 static bool logtag_valid = false;   // 是否有标签可写入
@@ -85,8 +101,8 @@ int ctl_mode = 0;      // 0 for torque control, 1 for mit control
 int ctl_type = 0;      // 0 for motion, 1 for force tracking, 2 for direct torque   
 
 int sensor_type = 0;   // 0 for using IMU, 1 for using encoder   
-int l_ctl_dir = 1;      //确实是左脚，1是向上
-int r_ctl_dir = -1;     //确实是右脚，1是向上
+int l_ctl_dir = -1;      //确实是左脚，1是向上
+int r_ctl_dir = 1;     //确实是右脚，1是向上
 
 
 
@@ -134,7 +150,7 @@ unsigned long previous_time_ble = 0;    // BLE 发送节拍
 /******************** 前置声明 ********************/
 void initial_CAN();
 void initial_Sig_motor();         // 这里给出一个“空实现”，防止链接错误
-void receive_tm_feedback();
+void receive_motor_feedback();
 void Receive_ble_Data();
 void Transmit_ble_Data();
 
@@ -266,240 +282,72 @@ float ext_gain          = 0.5f;
 float ext_phase_frac_L  = 0.3f;
 float ext_phase_frac_R  = 0.3f;
 float lead_frac         = 0.06f;
-float gate_k            = 1.0f;
 float gate_p_on         = 2.5f;
 
-// ===== Extension 复制/回放配置（按你要求的默认值，gui不修改）=====
-static const bool  use_ext_copy   = true;   // 开关
-volatile bool  ext_enable_L = true;        // 只在左腿复制 extension
-volatile bool  ext_enable_R = true;       // 右腿默认不复制
-/******************** loop ********************/
+// ====== 用户输入 / 调参 ======
+float kappa = 3.0f;        // 助力强度 gain κ
+float delay_s = 0.25f;     // 延迟 Δt (second)
+
+// ====== 内部变量 ======
+const int BUF_LEN = 200;   // 100Hz  → 200 samples ≈ 2s buffer
+float y_buffer[BUF_LEN];
+int buf_idx = 0;
+
+// 低通滤波
+float LPF(float prev, float raw, float alpha) {
+  return (1.0f - alpha) * prev + alpha * raw;
+}
+
 void loop() {
   imu.READ();
-  Serial_Com.READ2();
   current_time = micros();
-  const float Ts = (float)Tinterval_ctrl_micros / 1e6f;  // 控制周期 (s)
 
-  // Serial.printf("RTx=%.2f° LTx=%.2f°\r\n", imu.RTx, imu.LTx);
- // === 简单失效/恢复判定 ===
-  if (fabs(imu.RTx) > 80.0f || fabs(imu.LTx) > 80.0f) {
-    if (imu_init_ok) {
-      Serial.println("[WARN] IMU角度超过 ±80°，关闭辅助");
-    }
-    imu_init_ok = 0;
-  } else {
-    if (!imu_init_ok) {
-      Serial.println("[OK] IMU角度回到安全范围，恢复辅助");
-    }
-    imu_init_ok = 1;
-  }
-  // —— 控制频率节拍（例如 100Hz）——
   if (current_time - previous_time >= Tinterval_ctrl_micros) {
     previous_time = current_time;
-    // 1) 接收 CAN 回包，刷新电机反馈
-    receive_tm_feedback();
 
-    // 2) 接收 BLE 下发（非阻塞，随时吸收）
+    receive_motor_feedback();
     Receive_ble_Data();
-    RLTx = imu.RTx - imu.LTx;
-    LTx_filtered_last = LTx_filtered;
-    LTx_filtered      = 0.9f * LTx_filtered_last + 0.1f * imu.LTx;
-    RTx_filtered_last = RTx_filtered;
-    RTx_filtered      = 0.9f * RTx_filtered_last + 0.1f * imu.RTx;
-    RLTx_filtered = RTx_filtered - LTx_filtered;
-    /************ 更新步态周期与初始化状态 ************/
-    static float RL_prev = 0.0f;
-    static uint32_t t_last_cross = 0;
 
-    const float RL_HYST_DEG = 3.0f;   // 跨零滞回阈值 ±3°
-    const float TGAIT_MIN_MS = 350.0f;
-    const float TGAIT_MAX_MS = 1800.0f;
-    const float TGAIT_SMOOTH_A = 0.35f;  // 平滑系数
+    float q_r_raw = imu.RTx * DEG_TO_RAD;
+    float q_l_raw = imu.LTx * DEG_TO_RAD;
 
-    // 检测负->正跨越
-    if (RL_prev <= -RL_HYST_DEG && RLTx_filtered >= RL_HYST_DEG) {
-      uint32_t now_ms = current_time / 1000UL;
+    static float q_r = 0.0f, q_l = 0.0f;
+    // 如果第一次运行，让滤波初值等于第一次采到的原始值（避免从 0 突变）
+    static bool lpf_inited = false;
+    if (!lpf_inited) { q_r = q_r_raw; q_l = q_l_raw; lpf_inited = true; }
 
-      if (t_last_cross > 0) {
-        float dt = (float)(now_ms - t_last_cross);
-        if (dt >= TGAIT_MIN_MS && dt <= TGAIT_MAX_MS) {
-          gait_inited = 1;  // ✅ 标记已检测到步态
-          // 指数平滑周期
-        }
-      }
-      t_last_cross = now_ms;
-    }
-    /************ 更新步态周期与初始化状态 ************/
+    q_r = LPF(q_r, q_r_raw, 0.05f);
+    q_l = LPF(q_l, q_l_raw, 0.05f);
 
+    float y = sin(q_r) - sin(q_l);
 
-    RLTx_delay[doi] = RLTx_filtered;
-    gait_freq = estimateFreqFromRLTx(RLTx_filtered, current_time);
+    // 第一次初始化 buffer（如果尚未）
+    // 先推进写指针（写入当前位置），这种约定：buf_idx 指向下一个要写的位置
+    buf_idx = (buf_idx + 1) % BUF_LEN;   // advance
+    y_buffer[buf_idx] = y;               // now write
 
-// ################################
-    int Assist_delay_dynamic = Assist_delay_gain;  // 基础值来自 GUI
-    const float BASE_FREQ = 0.7f;      // 基准步频 (Hz)
-    const int   BASE_DELAY = Assist_delay_gain;  // 当前 GUI 设置对应 0.7Hz 时的基准
-    if (gait_freq > BASE_FREQ) {
-      Assist_delay_dynamic = (int)(BASE_DELAY * (BASE_FREQ / gait_freq));
-      if (Assist_delay_dynamic < 5) Assist_delay_dynamic = 5;   // 最小延迟样本保护
-    }
-    delayindex = doi - Assist_delay_dynamic;
-    if (delayindex < 0)              delayindex += 100;
-    else if (delayindex >= 100)      delayindex -= 100;
-    // === 各腿相位偏移（可保留，默认0不影响）===
-    int idx_L = (delayindex + phase_offset_L + 100) % 100;
-    int idx_R = (delayindex + phase_offset_R + 100) % 100;
-    // === 推进缓冲指针 ===
-    doi = (doi + 1) % 100;
+    // 计算 Ndelay（用 round 更稳）
+    float Ts = Tinterval_ctrl_micros / 1e6f;
+    int Ndelay = (int)lrintf(delay_s / Ts);   // 四舍五入
+    // 保护 Ndelay：至少 0，最多 BUF_LEN-1
+    if (Ndelay < 0) Ndelay = 0;
+    if (Ndelay >= BUF_LEN) Ndelay = BUF_LEN - 1;
 
-    /* ---------- 原始对称扭矩（极简版） ---------- */
-    const float phL = RLTx_delay[idx_L];
-    const float phR = RLTx_delay[idx_R];
+    // 读取延迟索引（相对于当前写指针）
+    int idx_d = buf_idx - Ndelay;
+    if (idx_d < 0) idx_d += BUF_LEN;
 
-    float tau_raw_L = 0.0f;
-    float tau_raw_R = 0.0f;
+    float tau = kappa * y_buffer[idx_d];
 
-    // 左腿（RLTx>=0 表示右腿伸展、左腿屈曲 → 取负号）
-    if (fabsf(phL) <= 120.0f)
-        tau_raw_L = (phL >= 0.0f ? -1.0f : +1.0f) * phL;
+    // 输出
+    M1_torque_command = -tau * r_ctl_dir;
+    M2_torque_command = +tau * l_ctl_dir;
 
-    // 右腿（RLTx>=0 表示右腿伸展 → 取正号）
-    if (fabsf(phR) <= 120.0f)
-        tau_raw_R = (phR >= 0.0f ? +1.0f : -1.0f) * phR;
-
-    /* --- 每腿功率门控输入 --- */
-    // 注意：右腿速度取负
-    RLTx = imu.RTx - imu.LTx;
-    LTx_filtered_last = LTx_filtered;
-    LTx_filtered      = 0.9f * LTx_filtered_last + 0.1f * imu.LTx;
-    RTx_filtered_last = RTx_filtered;
-    RTx_filtered      = 0.9f * RTx_filtered_last + 0.1f * imu.RTx;
-    RLTx_filtered = RTx_filtered - LTx_filtered;
-
-    /* --- 角速度(°/s) ---> rad/s 更物理，不过比例因子无关宏旨 --- 而且不能用imu读取的！！*/
-    const float LTx_vel = (LTx_filtered - LTx_filtered_last) * (PI/180.0f) / Ts;
-    const float RTx_vel = (RTx_filtered - RTx_filtered_last) * (PI/180.0f) / Ts;
-    
-    const float xL_raw = tau_raw_L * LTx_vel;
-    const float xR_raw = tau_raw_R * (-RTx_vel);
-
-
-    /********* 功率门控：仅用 lead_frac * T_gait_ms，去掉 gate_lead_ms/leadms *********/
-
-    // 1) 计算门控超前时间（ms）
-    //    - gait 已初始化：lead_ms = lead_frac * T_gait_ms
-    //    - 未初始化：用一个保底 35ms（可按需改）
-    //    - 做基本夹紧，避免极端
-    float lead_ms = 35.0f;  // fallback
-    if (gait_inited && gait_freq > 0.01f) {
-      float T_gait_ms = 1000.0f / gait_freq;        // Hz → ms
-      lead_ms = lead_frac * T_gait_ms;               // 例如 0.06 * 周期
-    }
-    if (lead_ms < 5.0f)   lead_ms = 5.0f;
-    if (lead_ms > 120.0f) lead_ms = 120.0f;
-
-    // 2) 线性前视预测（基于斜率）
-    const float xL_pred = lead_predict(xL_raw, xL_prev, lead_ms, Ts);
-    const float xR_pred = lead_predict(xR_raw, xR_prev, lead_ms, Ts);
-    xL_prev = xL_raw;   // 记住本帧 raw，下一帧当作“上一帧”
-    xR_prev = xR_raw;
-
-    // 3) 平滑门控（阈值在 gate_p_on，斜率由 gate_k）
-    const float gate_L = smooth_gate_p(xL_prev, gate_k, gate_p_on);
-    const float gate_R = smooth_gate_p(xR_prev, gate_k, gate_p_on);
-
-    // 4) 门后“原始”扭矩（此处仍不施加任何增益，保持线性）
-    //    这里的 tau_raw_* 是你上一步“对称扭矩（极简版）”算出来的
-    float tau_gate_L = tau_raw_L * gate_L;
-    float tau_gate_R = tau_raw_R * gate_R;
-
-    // 5) 一阶低通
-    tau_cmd_L_filt = 0.85f * tau_cmd_L_filt + (1.0f - 0.85f) * tau_gate_L;
-    tau_cmd_R_filt = 0.85f * tau_cmd_R_filt + (1.0f - 0.85f) * tau_gate_R;
-
-    // 6) 输出给下游（后面再做增益、slew、饱和、下发）
-    S_torque_command_left  = tau_cmd_L_filt* scale_all;
-    S_torque_command_right = tau_cmd_R_filt* scale_all;
-
-    float S_src_L = tau_cmd_L_filt* scale_all;  // LPF 后
-    float S_src_R = tau_cmd_R_filt* scale_all;
-
-    auto keep_if_flex = [](float S, int8_t sign){ return ((sign > 0) ? (S > 0.0f) : (S < 0.0f)) ? S : 0.0f; };
-    float flexL_now = keep_if_flex(S_src_L, flex_sign_L);  // 例如 flex_sign_L=-1 代表“负值为屈”
-    float flexR_now = keep_if_flex(S_src_R, flex_sign_R);
-
-    int w = ext_i % EXT_BUF_LEN;
-    flexL_hist[w] = flexL_now;
-    flexR_hist[w] = flexR_now;
-
-
-    float T_gait_ms1 = 1000.0f / gait_freq;        // Hz → ms
-
-    // —— 计算 extension 延迟时间（ms）= 百分比 × 当前周期 ——
-    // 未估到步态时，退回到固定 ms（你原先的 ext_delay_ms）
-    float ext_ms_L = ext_phase_frac_L * T_gait_ms1;
-    float ext_ms_R = ext_phase_frac_R * T_gait_ms1;
-    // Serial.printf("RTx=%.2f°  LTx=%.2f°  |  fR=%.2fHz  fL=%.2fHz  avg=%.2fHz\r\n",
-    //   imu.RTx, imu.LTx,
-    //   T_gait_ms1, ext_ms_L, ext_ms_R);
-    // —— 安全夹紧（避免极端）——
-    auto clampf = [](float x, float a, float b){ return (x<a)?a:((x>b)?b:x); };
-    ext_ms_L = clampf(ext_ms_L, 30.0f, 1200.0f);
-    ext_ms_R = clampf(ext_ms_R, 30.0f, 1200.0f);
-
-    // —— ms → 样本数：N = round( ext_ms / Ts ) ——
-    // 注意 Ts 是“秒”，所以 / (1000*Ts)
-    int extN_L = (int)lrintf(ext_ms_L / (1000.0f * Ts));
-    int extN_R = (int)lrintf(ext_ms_R / (1000.0f * Ts));
-    if (extN_L >= EXT_BUF_LEN) extN_L = EXT_BUF_LEN - 1;
-    if (extN_R >= EXT_BUF_LEN) extN_R = EXT_BUF_LEN - 1;
-    if (extN_L < 1) extN_L = 1;
-    if (extN_R < 1) extN_R = 1;
-
-    // —— 回读延迟后的 flexion（复制成 extension = 取相反号 × 增益）——
-    int rL = ext_i - extN_L;
-    int rR = ext_i - extN_R;
-    // 正模
-    if (rL < 0) rL += ((-rL / EXT_BUF_LEN) + 1) * EXT_BUF_LEN;
-    if (rR < 0) rR += ((-rR / EXT_BUF_LEN) + 1) * EXT_BUF_LEN;
-    rL %= EXT_BUF_LEN;  rR %= EXT_BUF_LEN;
-
-    float S_L_ext = 0.0f, S_R_ext = 0.0f;
-    if (use_ext_copy) {
-      if (ext_enable_L) S_L_ext = -ext_gain * flexL_hist[rL];
-      if (ext_enable_R) S_R_ext = -ext_gain * flexR_hist[rR];
-    }
-
-
-
-    // —— 叠加，得到最终 S ——
-    //（这里保持你前面 S_src_* 的定义：LPF 后 or 门后）
-    S_torque_command_left  = S_src_L + S_L_ext;
-    S_torque_command_right = S_src_R + S_R_ext;
-    S_torque_command_left = gait_freq*1.2 * S_torque_command_left;
-    S_torque_command_right = gait_freq*1.2 * S_torque_command_right;
-    // 推进写指针
-    ext_i++;
-
-
-
-
-
-
-
-
-
-
-    M1_torque_command = S_torque_command_right * r_ctl_dir;
-    M2_torque_command = S_torque_command_left  * l_ctl_dir;
-    // M1_torque_command = slew(M1_torque_command, M1_prev, torque_rate, Ts);
-    // M2_torque_command = slew(M2_torque_command, M2_prev, torque_rate, Ts);
-    // M1_prev = M1_torque_command;
-    // M2_prev = M2_torque_command;
-
-    /* --- 饱和 --- */
     M1_torque_command = clip_torque(M1_torque_command);
     M2_torque_command = clip_torque(M2_torque_command);
+  }
+
+
 
 
     if (!imu_init_ok) {
@@ -509,12 +357,18 @@ void loop() {
                                                         /* aaaaaaaaa */
 
 
-    // 3) TODO: 在这里放入你的“算法/控制器”计算，写入 M1_torque_command / M2_torque_command
-    //    —— 当前阶段我们不做任何控制：保持命令=0 或者来自上位机的占位值 ——
-
     // 4) 下发电机命令（MIT/力矩等，按你库的 send_cmd 接口）
-    sig_m1.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, (float)M1_torque_command);
-    sig_m2.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, (float)M2_torque_command);
+    #if MOTOR_BRAND == 0
+      for (int i = 0; i < 4; ++i) receive_motor_feedback();
+      sig_m1.sig_torque_cmd(M1_torque_command/9.76);
+      sig_m2.sig_torque_cmd(M2_torque_command/9.76);
+    #else
+      for (int i = 0; i < 4; ++i) receive_motor_feedback();
+      // TMOTOR 下发（扭矩 only）
+      sig_m1.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, (float)M1_torque_command);
+      sig_m2.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, (float)M2_torque_command);
+    #endif
+  
 
     // 5) 记录（可扩展）：与你给的“可扩展 SD 打印”一致
     if (logger.isOpen()) {
@@ -530,18 +384,18 @@ void loop() {
       logger.print(imu.TX4, 4);                logger.print(',');
       logger.print(RLTx_delay[doi], 4);        logger.print(',');
       logger.print(torque_delay[doi], 4);      logger.print(',');
-      logger.print(tau_raw_L, 4);              logger.print(',');
-      logger.print(tau_raw_R, 4);              logger.print(',');
-      logger.print(S_torque_command_left, 4);  logger.print(',');
-      logger.print(S_torque_command_right, 4); logger.print(',');
+      logger.print(0.0f, 4);              logger.print(',');
+      logger.print(0.0f, 4);              logger.print(',');
+      logger.print(0.0f, 4);  logger.print(',');
+      logger.print(0.0f, 4); logger.print(',');
       logger.print(M1_torque_command, 4);      logger.print(',');
       logger.print(M2_torque_command, 4);      logger.print(',');
-      logger.print(Rescaling_gain, 4);         logger.print(',');
+      logger.print(0.0f, 4);         logger.print(',');
       logger.print(imu.RTAVx, 4);              logger.print(',');
       logger.print(imu.LTAVx, 4);              logger.print(',');
-      logger.print(gait_freq, 4);               logger.print(',');
-      logger.print(S_src_R, 4);                   logger.print(',');
-      logger.print(S_src_L, 4);                   logger.print(',');
+      logger.print(0.0f, 4);               logger.print(',');
+      logger.print(0.0f, 4);                   logger.print(',');
+      logger.print(0.0f, 4);                   logger.print(',');
       if (logtag_valid) {
         logger.print(logtag);
         logger.print(',');
@@ -553,8 +407,8 @@ void loop() {
         logger.print(',');
       }
       
-      logger.print(S_R_ext, 4);                   logger.print(',');
-      logger.print(S_L_ext, 4);
+      logger.print(0.0f, 4);                   logger.print(',');
+      logger.print(0.0f, 4);
       logger.println();
       static int log_flush_count = 0;
       if (++log_flush_count >= 10) {   // 每10行 flush 一次
@@ -562,7 +416,7 @@ void loop() {
         log_flush_count = 0;
       }
     }
-  }
+
 
   if (current_time - previous_time_ble >= Tinterval_ble_micros) {
     previous_time_ble = current_time;
@@ -584,16 +438,13 @@ void loop() {
     Serial.printf("fR=%.2fHz  fL=%.2fHz  avg=%.2fHz  |  ωL=%.2frad/s  ωR=%.2frad/s  |  τL=%.2f  τR=%.2f\r\n",
       imu.RTx, imu.LTx, max_torque_cfg,
       imu.RTx, imu.LTx,
-      M1_torque_command, M2_torque_command);
+      M1_torque_command/9.76, M1_torque_command/9.76);
     // Serial.printf("Rescale=%.2f  Flex=%.2f  Ext=%.2f  |  CmdM1=%.2f  CmdM2=%.2f  |  Delay=%.1fms\r\n",
     //   Rescaling_gain, Flex_Assist_gain, Ext_Assist_gain,
     //   M1_torque_command, M2_torque_command,
     //   Assist_delay_gain);
     #endif
   }
-
-
-
 }
 
 
@@ -662,40 +513,101 @@ void initial_CAN() {
 }
 
 void initial_Sig_motor() {
-  sig_m1.enter_control_mode();
-  delay(50);
-  sig_m2.enter_control_mode();
-  delay(50);
-  sig_m1.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-  sig_m2.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-  uint32_t t0 = millis();
-  while (millis() - t0 < 500) {
-    CAN_message_t mr;
-    while (Can3.read(mr)) {
-      sig_m1.unpack_reply(mr);
-      sig_m2.unpack_reply(mr);
+  #if MOTOR_BRAND == 0
+    sig_m1.sig_torque_ctl_mode_start();    
+    delay(200);   
+    sig_m2.sig_torque_ctl_mode_start();        
+    sig_m1.sig_motor_start();    
+    sig_m1.request_pos_vel();    
+    sig_m2.sig_motor_start();    
+    sig_m2.request_pos_vel();     
+    sig_m1.sig_torque_cmd(0.01);    
+    delay(200);    
+    // sig_m2.request_torque();   
+    sig_m2.sig_torque_cmd(0.01);      
+    delay(200);   
+    for (int i =0; i < 1000; i++)
+    {
+      receive_motor_feedback();     
     }
+    delay(1000);   
+    initial_pos_1 = sig_m1.pos;     
+    initial_pos_2 = sig_m2.pos;     
+    delay(500);  
+    /////// command initial setting ///////
+    M1_torque_command = 0.0;         
+    M2_torque_command = 0.0;   
+  #else
+    // TMOTOR 初始化逻辑（基于你之前的 tmotor 片段）
+    sig_m1.enter_control_mode(); // 若 tmotor 没有此函数，改为 sig_m1.send_cmd(0,...)
+    delay(50);
+    sig_m2.enter_control_mode();
+    delay(50);
+    sig_m1.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    sig_m2.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    uint32_t t0 = millis();
+    while (millis() - t0 < 500) {
+      CAN_message_t mr;
+      while (Can3.read(mr)) {
+        sig_m1.unpack_reply(mr);
+        sig_m2.unpack_reply(mr);
+      }
+    }
+    initial_pos_1 = sig_m1.pos;
+    initial_pos_2 = sig_m2.pos;
+    M1_torque_command = 0.0;
+    M2_torque_command = 0.0;
+    Serial.println("TMOTOR init done.");
+  #endif
   }
-  initial_pos_1 = sig_m1.pos;
-  initial_pos_2 = sig_m2.pos;
-  M1_torque_command = 0.0;
-  M2_torque_command = 0.0;
-
-  Serial.println("tmotor torque-only (t_ff) path ready.");
-}
+  
 
 
-void receive_tm_feedback() {
-  CAN_message_t mr;
-  while (Can3.read(mr)) {
-    sig_m1.unpack_reply(mr);
-    sig_m2.unpack_reply(mr);
+// 统一接收反馈：SIG 与 TMOTOR 共用一个接口
+void receive_motor_feedback() {
+  #if MOTOR_BRAND == 0
+      // ---- SIG 路径：按 msgR.id 解析 pos/iq 等 ----
+      CAN_message_t msgR;
+      while (Can3.read(msgR)) {
+          switch (msgR.id) {
+              case ID_M1_POSVEL:
+                  sig_m1.unpack_pos_vel(msgR, initial_pos_1);
+                  break;
+              case ID_M1_IQ: {
+                  float iq = *(float *)&msgR.buf[4];
+                  sig_m1.torque = iq * KT_1;
+                  break;
+              }
+              case ID_M2_POSVEL:
+                  sig_m2.unpack_pos_vel(msgR, initial_pos_2);
+                  break;
+              case ID_M2_IQ: {
+                  float iq = *(float *)&msgR.buf[4];
+                  sig_m2.torque = iq * KT_2;
+                  break;
+              }
+              default:
+                  // 如果有其它 SIG 消息也可能在这里处理
+                  break;
+          }
+      }
+      // SIG：把实测扭矩同步到全局测量变量（如果你还同时用sig_m?.torque也可以）
+      M1_torque_meas = sig_m1.torque;
+      M2_torque_meas = sig_m2.torque;
+  
+  #else
+      // ---- TMOTOR 路径：直接 unpack_reply() 并同步 torque 字段 ----
+      CAN_message_t mr;
+      while (Can3.read(mr)) {
+          sig_m1.unpack_reply(mr);
+          sig_m2.unpack_reply(mr);
+      }
+      // 同步实测扭矩（Nm）
+      M1_torque_meas = sig_m1.torque;
+      M2_torque_meas = sig_m2.torque;
+  #endif
   }
-  // 同步实测扭矩（Nm）
-  M1_torque_meas = sig_m1.torque;
-  M2_torque_meas = sig_m2.torque;
-}
-
+  
 /******************** BLE：接收 ********************/
 /******************** BLE：接收（带占位、32字节帧） ********************/
 void Receive_ble_Data() {
@@ -783,7 +695,7 @@ void Receive_ble_Data() {
     // new_phase_offset_L = (int8_t)constrain(new_phase_offset_L, -90, 90);
     // new_phase_offset_R = (int8_t)constrain(new_phase_offset_R, -90, 90);
 
-    new_gate_k            = clampf(new_gate_k,            0.0f, 10.0f);
+    new_gate_k            = clampf(new_gate_k,            0.0f, 50.0f);
     new_gate_p_on         = clampf(new_gate_p_on,         0.0f, 10.0f);
 
     new_lead_frac         = clampf(new_lead_frac,         0.0f, 0.1f);
@@ -803,11 +715,11 @@ void Receive_ble_Data() {
     Flex_Assist_gain  = new_Flex_Assist_gain;
     Ext_Assist_gain   = new_Ext_Assist_gain;
 
-    Assist_delay_gain = new_Assist_delay_gain;
+    delay_s = new_Assist_delay_gain;
     phase_offset_L    = new_phase_offset_L;
     phase_offset_R    = new_phase_offset_R;
 
-    gate_k            = new_gate_k;
+    kappa            = new_gate_k;
     gate_p_on         = new_gate_p_on;
 
     lead_frac         = new_lead_frac;
@@ -836,8 +748,14 @@ void Transmit_ble_Data() {
   // 1) 量化为 int16 = 值 * 100（小端）
   int16_t L_ang100   = (int16_t)roundf(imu.LTx * 100.0f);
   int16_t R_ang100   = (int16_t)roundf(imu.RTx * 100.0f);
-  int16_t L_tau100   = (int16_t)roundf(sig_m1.torque * 100.0f);
-  int16_t R_tau100   = (int16_t)roundf(sig_m2.torque * 100.0f);
+  #if MOTOR_BRAND == 0
+    int16_t L_tau100 = (int16_t)roundf(sig_m1.torque * 100.0f);
+    int16_t R_tau100 = (int16_t)roundf(sig_m2.torque * 100.0f);
+  #else
+    int16_t L_tau100 = (int16_t)roundf(sig_m1.torque * 100.0f);
+    int16_t R_tau100 = (int16_t)roundf(sig_m2.torque * 100.0f);
+  #endif
+
   int16_t L_cmd100   = (int16_t)roundf(M1_torque_command * 100.0f);
   int16_t R_cmd100   = (int16_t)roundf(M2_torque_command * 100.0f);
   int16_t mt100 = (int16_t)roundf(max_torque_cfg * 100.0f);

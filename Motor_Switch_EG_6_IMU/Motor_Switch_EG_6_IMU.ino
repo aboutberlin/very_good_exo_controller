@@ -10,12 +10,29 @@
 #include "SdFat.h"
 #include "RingBuf.h"
 #include "sdlogger.h" 
+
+#include "Motor_Control_Tmotor.h"
+// SIG 所需 ID（如果已定义可跳过）
+const uint16_t ID_M1_POSVEL = (0x002<<5) | 0x009; // 0x049
+const uint16_t ID_M1_TORQUE = (0x002<<5) | 0x01C; // 0x05C
+const uint16_t ID_M2_POSVEL = (0x001<<5) | 0x009; // 0x029
+const uint16_t ID_M2_TORQUE = (0x001<<5) | 0x01C; // 0x03C
+const uint16_t ID_M1_IQ = (0x002<<5) | 0x014; // 0x064
+const uint16_t ID_M2_IQ = (0x001<<5) | 0x014; // 0x034
+
+#define KT_1 0.67f
+#define KT_2 0.67f
+
+
+//更换代码之前，rm -rf /home/joe/.cache/arduino/sketches/*
+
+// ====== Motor brand switch (0 = SIG, 1 = TMOTOR) ======
+#define MOTOR_BRAND 1  
+
 #ifndef DEBUG_PRINT
 #define DEBUG_PRINT 1   // 改成 0 关闭所有调试打印
 #endif
 #define GUI_WRITE_ENABLE   1   // 把它改成0就是锁死
-
-#include "Motor_Control_Tmotor.h"
 // --- LOGTAG 全局变量 ---
 static char logtag[11] = {0};       // 最多10字符 + '\0'
 static bool logtag_valid = false;   // 是否有标签可写入
@@ -26,6 +43,17 @@ const unsigned long PRINT_INTERVAL_US = 100000; // 10 Hz
 static unsigned long prev_print_us = 0;
 
 /******************** 常量/类型 ********************/
+
+// 在全局增加：六路状态
+static uint8_t imu_ok_bits = 0;   // bit0..5 分别表示 L,R,1,2,3,4
+
+
+static inline bool is_inactive(float v) {
+  // 你用 -97 作为“未激活”哨兵，这里留一点容差
+  return fabsf(v + 97.0f) < 0.5f;
+}
+
+
 const float DEG2RAD = PI / 180.0f;
 
 // Teensy CAN3
@@ -134,7 +162,7 @@ unsigned long previous_time_ble = 0;    // BLE 发送节拍
 /******************** 前置声明 ********************/
 void initial_CAN();
 void initial_Sig_motor();         // 这里给出一个“空实现”，防止链接错误
-void receive_tm_feedback();
+void receive_motor_feedback();
 void Receive_ble_Data();
 void Transmit_ble_Data();
 
@@ -274,8 +302,45 @@ static const bool  use_ext_copy   = true;   // 开关
 volatile bool  ext_enable_L = true;        // 只在左腿复制 extension
 volatile bool  ext_enable_R = true;       // 右腿默认不复制
 /******************** loop ********************/
+
+// 全局：GUI 请求 IMU 重初始化的标志 & 忙状态
+bool imu_reinit_pending = false;
+bool motor_reinit_pending = false;
+
+
 void loop() {
-  imu.READ();
+
+
+  if (imu_reinit_pending) {
+    imu_reinit_pending = false;  // 清标志，防止重复
+    Serial.println("[CMD] IMU reinit requested by GUI");
+    imu.REZERO_LR(600, 200);  
+    Serial.println("[IMU] Reinitialization done");
+    imu_init_ok = 1;  // 恢复状态
+  }
+
+  if (motor_reinit_pending) {
+    motor_reinit_pending = false;
+    Serial.println("[CMD] MOTOR reinit requested by GUI");
+    // 占位：后面会加实际 reinit 函数
+    reinit_Sig_motor();  
+    Serial.println("[MOTOR] Reinitialization done");
+  }
+  
+
+
+  imu.READ();  // 已有
+  // ---- 六路健康检测 ----
+  uint8_t okL = (!is_inactive(imu.LTx)) ? 1 : 0;
+  uint8_t okR = (!is_inactive(imu.RTx)) ? 1 : 0;
+  uint8_t ok1 = (!is_inactive(imu.TX1)) ? 1 : 0;
+  uint8_t ok2 = (!is_inactive(imu.TX2)) ? 1 : 0;
+  uint8_t ok3 = (!is_inactive(imu.TX3)) ? 1 : 0;
+  uint8_t ok4 = (!is_inactive(imu.TX4)) ? 1 : 0;
+
+  imu_ok_bits = (okL<<0) | (okR<<1) | (ok1<<2) | (ok2<<3) | (ok3<<4) | (ok4<<5);
+
+
   Serial_Com.READ2();
   current_time = micros();
   const float Ts = (float)Tinterval_ctrl_micros / 1e6f;  // 控制周期 (s)
@@ -297,7 +362,7 @@ void loop() {
   if (current_time - previous_time >= Tinterval_ctrl_micros) {
     previous_time = current_time;
     // 1) 接收 CAN 回包，刷新电机反馈
-    receive_tm_feedback();
+    receive_motor_feedback();
 
     // 2) 接收 BLE 下发（非阻塞，随时吸收）
     Receive_ble_Data();
@@ -492,10 +557,10 @@ void loop() {
 
     M1_torque_command = S_torque_command_right * r_ctl_dir;
     M2_torque_command = S_torque_command_left  * l_ctl_dir;
-    // M1_torque_command = slew(M1_torque_command, M1_prev, torque_rate, Ts);
-    // M2_torque_command = slew(M2_torque_command, M2_prev, torque_rate, Ts);
-    // M1_prev = M1_torque_command;
-    // M2_prev = M2_torque_command;
+    M1_torque_command = slew(M1_torque_command, M1_prev, torque_rate, Ts);
+    M2_torque_command = slew(M2_torque_command, M2_prev, torque_rate, Ts);
+    M1_prev = M1_torque_command;
+    M2_prev = M2_torque_command;
 
     /* --- 饱和 --- */
     M1_torque_command = clip_torque(M1_torque_command);
@@ -513,8 +578,17 @@ void loop() {
     //    —— 当前阶段我们不做任何控制：保持命令=0 或者来自上位机的占位值 ——
 
     // 4) 下发电机命令（MIT/力矩等，按你库的 send_cmd 接口）
-    sig_m1.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, (float)M1_torque_command);
-    sig_m2.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, (float)M2_torque_command);
+    #if MOTOR_BRAND == 0
+      for (int i = 0; i < 4; ++i) receive_motor_feedback();
+      sig_m1.sig_torque_cmd(M1_torque_command/9.76);
+      sig_m2.sig_torque_cmd(M2_torque_command/9.76);
+    #else
+      for (int i = 0; i < 4; ++i) receive_motor_feedback();
+      // TMOTOR 下发（扭矩 only）
+      sig_m1.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, (float)M1_torque_command);
+      sig_m2.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, (float)M2_torque_command);
+    #endif
+  
 
     // 5) 记录（可扩展）：与你给的“可扩展 SD 打印”一致
     if (logger.isOpen()) {
@@ -584,7 +658,7 @@ void loop() {
     Serial.printf("fR=%.2fHz  fL=%.2fHz  avg=%.2fHz  |  ωL=%.2frad/s  ωR=%.2frad/s  |  τL=%.2f  τR=%.2f\r\n",
       imu.RTx, imu.LTx, max_torque_cfg,
       imu.RTx, imu.LTx,
-      M1_torque_command, M2_torque_command);
+      M1_torque_command/9.76, M1_torque_command/9.76);
     // Serial.printf("Rescale=%.2f  Flex=%.2f  Ext=%.2f  |  CmdM1=%.2f  CmdM2=%.2f  |  Delay=%.1fms\r\n",
     //   Rescaling_gain, Flex_Assist_gain, Ext_Assist_gain,
     //   M1_torque_command, M2_torque_command,
@@ -662,41 +736,152 @@ void initial_CAN() {
 }
 
 void initial_Sig_motor() {
-  sig_m1.enter_control_mode();
-  delay(50);
-  sig_m2.enter_control_mode();
-  delay(50);
-  sig_m1.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-  sig_m2.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-  uint32_t t0 = millis();
-  while (millis() - t0 < 500) {
-    CAN_message_t mr;
-    while (Can3.read(mr)) {
-      sig_m1.unpack_reply(mr);
-      sig_m2.unpack_reply(mr);
+  #if MOTOR_BRAND == 0
+    sig_m1.sig_torque_ctl_mode_start();    
+    delay(200);   
+    sig_m2.sig_torque_ctl_mode_start();        
+    sig_m1.sig_motor_start();    
+    sig_m1.request_pos_vel();    
+    sig_m2.sig_motor_start();    
+    sig_m2.request_pos_vel();     
+    sig_m1.sig_torque_cmd(0.01);    
+    delay(200);    
+    // sig_m2.request_torque();   
+    sig_m2.sig_torque_cmd(0.01);      
+    delay(200);   
+    for (int i =0; i < 1000; i++)
+    {
+      receive_motor_feedback();     
     }
+    delay(1000);   
+    initial_pos_1 = sig_m1.pos;     
+    initial_pos_2 = sig_m2.pos;     
+    delay(500);  
+    /////// command initial setting ///////
+    M1_torque_command = 0.0;         
+    M2_torque_command = 0.0;   
+  #else
+    // TMOTOR 初始化逻辑（基于你之前的 tmotor 片段）
+    sig_m1.enter_control_mode(); // 若 tmotor 没有此函数，改为 sig_m1.send_cmd(0,...)
+    delay(50);
+    sig_m2.enter_control_mode();
+    delay(50);
+    sig_m1.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    sig_m2.send_cmd(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    uint32_t t0 = millis();
+    while (millis() - t0 < 500) {
+      CAN_message_t mr;
+      while (Can3.read(mr)) {
+        sig_m1.unpack_reply(mr);
+        sig_m2.unpack_reply(mr);
+      }
+    }
+    initial_pos_1 = sig_m1.pos;
+    initial_pos_2 = sig_m2.pos;
+    M1_torque_command = 0.0;
+    M2_torque_command = 0.0;
+    Serial.println("TMOTOR init done.");
+  #endif
   }
-  initial_pos_1 = sig_m1.pos;
-  initial_pos_2 = sig_m2.pos;
-  M1_torque_command = 0.0;
-  M2_torque_command = 0.0;
+  
 
-  Serial.println("tmotor torque-only (t_ff) path ready.");
-}
+  void reinit_Sig_motor() {
+    #if MOTOR_BRAND == 0
+      M1_torque_command = 0.0f;
+      M2_torque_command = 0.0f;
+      sig_m1.reboot();
+      sig_m2.reboot();
+      delay(100);
+      sig_m1.sig_torque_ctl_mode_start();    
+      delay(200);   
+      sig_m2.sig_torque_ctl_mode_start();        
+      sig_m1.sig_motor_start();    
+      sig_m2.sig_motor_start();    
 
+      // 4) 读取一段反馈，让pos稳定
+      for (int i = 0; i < 1000; i++) receive_motor_feedback();
+      delay(300);
+      initial_pos_1 = sig_m1.pos;
+      initial_pos_2 = sig_m2.pos;
+      sig_m1.sig_torque_cmd(0.01f);
+      delay(100);
+      sig_m2.sig_torque_cmd(0.01f);
+      delay(100);
+      sig_m1.sig_torque_cmd(0.0f);
+      sig_m2.sig_torque_cmd(0.0f);  
+    #else
+      // TMOTOR 初始化逻辑（基于你之前的 tmotor 片段）
+      sig_m1.exit_control_mode(); // 若 tmotor 没有此函数，改为 sig_m1.send_cmd(0,...)
+      delay(50);
+      sig_m2.exit_control_mode();
+      delay(50);
+      sig_m1.enter_control_mode(); // 若 tmotor 没有此函数，改为 sig_m1.send_cmd(0,...)
+      delay(50);
+      sig_m2.enter_control_mode(); // 若 tmotor 没有此函数，改为 sig_m1.send_cmd(0,...)
 
-void receive_tm_feedback() {
-  CAN_message_t mr;
-  while (Can3.read(mr)) {
-    sig_m1.unpack_reply(mr);
-    sig_m2.unpack_reply(mr);
+      uint32_t t0 = millis();
+      while (millis() - t0 < 500) {
+        CAN_message_t mr;
+        while (Can3.read(mr)) {
+          sig_m1.unpack_reply(mr);
+          sig_m2.unpack_reply(mr);
+        }
+      }
+      initial_pos_1 = sig_m1.pos;
+      initial_pos_2 = sig_m2.pos;
+      M1_torque_command = 0.0;
+      M2_torque_command = 0.0;
+      Serial.println("TMOTOR init done.");
+    #endif
+    }
+
+    
+
+// 统一接收反馈：SIG 与 TMOTOR 共用一个接口
+void receive_motor_feedback() {
+  #if MOTOR_BRAND == 0
+      // ---- SIG 路径：按 msgR.id 解析 pos/iq 等 ----
+      CAN_message_t msgR;
+      while (Can3.read(msgR)) {
+          switch (msgR.id) {
+              case ID_M1_POSVEL:
+                  sig_m1.unpack_pos_vel(msgR, initial_pos_1);
+                  break;
+              case ID_M1_IQ: {
+                  float iq = *(float *)&msgR.buf[4];
+                  sig_m1.torque = iq * KT_1;
+                  break;
+              }
+              case ID_M2_POSVEL:
+                  sig_m2.unpack_pos_vel(msgR, initial_pos_2);
+                  break;
+              case ID_M2_IQ: {
+                  float iq = *(float *)&msgR.buf[4];
+                  sig_m2.torque = iq * KT_2;
+                  break;
+              }
+              default:
+                  // 如果有其它 SIG 消息也可能在这里处理
+                  break;
+          }
+      }
+      // SIG：把实测扭矩同步到全局测量变量（如果你还同时用sig_m?.torque也可以）
+      M1_torque_meas = sig_m1.torque;
+      M2_torque_meas = sig_m2.torque;
+  
+  #else
+      // ---- TMOTOR 路径：直接 unpack_reply() 并同步 torque 字段 ----
+      CAN_message_t mr;
+      while (Can3.read(mr)) {
+          sig_m1.unpack_reply(mr);
+          sig_m2.unpack_reply(mr);
+      }
+      // 同步实测扭矩（Nm）
+      M1_torque_meas = sig_m1.torque;
+      M2_torque_meas = sig_m2.torque;
+  #endif
   }
-  // 同步实测扭矩（Nm）
-  M1_torque_meas = sig_m1.torque;
-  M2_torque_meas = sig_m2.torque;
-}
-
-/******************** BLE：接收 ********************/
+  
 /******************** BLE：接收（带占位、32字节帧） ********************/
 void Receive_ble_Data() {
   static uint8_t hdr[3] = {0};
@@ -714,9 +899,10 @@ void Receive_ble_Data() {
       continue;
     }
 
-    // 2) 确认串口里够一整帧payload
-    if (Serial5.available() < PAYLOAD_LEN) {
-      return; // 数据没全，不阻塞
+    size_t n = Serial5.readBytes((char*)data_rs232_rx, PAYLOAD_LEN);
+    if (n < PAYLOAD_LEN) {
+      Serial.printf("[BLE] Payload incomplete: got %d / %d bytes\n", n, PAYLOAD_LEN);
+      return;
     }
 
     // 3) 读payload进 data_rs232_rx[0 .. PAYLOAD_LEN-1]
@@ -752,7 +938,7 @@ void Receive_ble_Data() {
     int8_t new_phase_offset_R   = (int8_t)data_rs232_rx[8];                      // 占位
 
     float new_gate_k            = rd_i16((uint8_t*)data_rs232_rx,  9) / 100.0f;  // 0~10
-    float new_gate_p_on         = rd_i16((uint8_t*)data_rs232_rx, 11) / 100.0f;  // 0~10
+    float new_gate_p_on         = rd_i16((uint8_t*)data_rs232_rx, 11) / 100.0f;  // 0~1000
 
     float new_lead_frac         = rd_i16((uint8_t*)data_rs232_rx, 13) / 1000.0f; // 0~0.1
 
@@ -762,8 +948,13 @@ void Receive_ble_Data() {
     float new_ext_gain          = rd_i16((uint8_t*)data_rs232_rx, 19) / 100.0f;  // -3~3
     float new_scale_all         = rd_i16((uint8_t*)data_rs232_rx, 21) / 100.0f;  // -1~1
     float new_max_torque_cfg = rd_i16((uint8_t*)data_rs232_rx, 23) / 100.0f;  // ★ [23..24]
-
-    // bytes [23..28] （甚至 [23..PAYLOAD_LEN-1]）为占位/保留
+    if (data_rs232_rx[25] == 1) {
+      imu_reinit_pending = true;  // 只设标志，不立即做
+    }
+    if (data_rs232_rx[26] == 1) {
+      motor_reinit_pending = true;  // ★ 新增占位
+    }
+    // bytes [26..28] （甚至 [23..PAYLOAD_LEN-1]）为占位/保留
     // 将来可以在这里继续解析更多字段，比如 max_torque_cfg 等
     // 现在我们就先忽略它们:
     // int16_t future_param = rd_i16((uint8_t*)data_rs232_rx, 23) / 100.0f;  // 示例
@@ -784,7 +975,7 @@ void Receive_ble_Data() {
     // new_phase_offset_R = (int8_t)constrain(new_phase_offset_R, -90, 90);
 
     new_gate_k            = clampf(new_gate_k,            0.0f, 10.0f);
-    new_gate_p_on         = clampf(new_gate_p_on,         0.0f, 10.0f);
+    new_gate_p_on         = clampf(new_gate_p_on,         0.0f, 1000.0f);
 
     new_lead_frac         = clampf(new_lead_frac,         0.0f, 0.1f);
     new_ext_phase_frac_L  = clampf(new_ext_phase_frac_L,  0.0f, 0.5f);
@@ -826,6 +1017,7 @@ void Receive_ble_Data() {
 
 /******************** BLE：发送（与你一致） ********************/
 void Transmit_ble_Data() {
+
   const uint8_t FRAME_LEN = 32;
   // 这里用 millis 作为时间基准（0.01s 精度）
 
@@ -836,8 +1028,14 @@ void Transmit_ble_Data() {
   // 1) 量化为 int16 = 值 * 100（小端）
   int16_t L_ang100   = (int16_t)roundf(imu.LTx * 100.0f);
   int16_t R_ang100   = (int16_t)roundf(imu.RTx * 100.0f);
-  int16_t L_tau100   = (int16_t)roundf(sig_m1.torque * 100.0f);
-  int16_t R_tau100   = (int16_t)roundf(sig_m2.torque * 100.0f);
+  #if MOTOR_BRAND == 0
+    int16_t L_tau100 = (int16_t)roundf(sig_m1.torque * 100.0f);
+    int16_t R_tau100 = (int16_t)roundf(sig_m2.torque * 100.0f);
+  #else
+    int16_t L_tau100 = (int16_t)roundf(sig_m1.torque * 100.0f);
+    int16_t R_tau100 = (int16_t)roundf(sig_m2.torque * 100.0f);
+  #endif
+
   int16_t L_cmd100   = (int16_t)roundf(M1_torque_command * 100.0f);
   int16_t R_cmd100   = (int16_t)roundf(M2_torque_command * 100.0f);
   int16_t mt100 = (int16_t)roundf(max_torque_cfg * 100.0f);
@@ -883,9 +1081,11 @@ void Transmit_ble_Data() {
 
   data_ble[23] = (uint8_t)(gf100 & 0xFF);
   data_ble[24] = (uint8_t)((gf100 >> 8) & 0xFF);
-
+  data_ble[25] = logtag_valid ? 1 : 0;
+  data_ble[26] = logtag[0];  // 只发首字母，或者发 1~2 个字节验证
+  data_ble[27] = imu_ok_bits;
   // 6) 其余占位清零（payload[21+] -> data_ble[25..31]）
-  for (int i = 25; i <= 31; ++i) data_ble[i] = 0;
+  for (int i = 28; i <= 31; ++i) data_ble[i] = 0;
 
   // 7) 发送
   Serial5.write((uint8_t*)data_ble, (size_t)FRAME_LEN);
