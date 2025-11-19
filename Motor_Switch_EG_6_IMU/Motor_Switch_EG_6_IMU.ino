@@ -11,7 +11,7 @@
 #include "RingBuf.h"
 #include "sdlogger.h" 
 
-#include "Sig_Motor_Control.h"
+#include "Motor_Control_Tmotor.h"
 // SIG 所需 ID（如果已定义可跳过）
 const uint16_t ID_M1_POSVEL = (0x002<<5) | 0x009; // 0x049
 const uint16_t ID_M1_TORQUE = (0x002<<5) | 0x01C; // 0x05C
@@ -27,7 +27,7 @@ const uint16_t ID_M2_IQ = (0x001<<5) | 0x014; // 0x034
 //更换代码之前，rm -rf /home/joe/.cache/arduino/sketches/*
 
 // ====== Motor brand switch (0 = SIG, 1 = TMOTOR) ======
-#define MOTOR_BRAND 0 
+#define MOTOR_BRAND 1 
 
 #ifndef DEBUG_PRINT
 #define DEBUG_PRINT 1   // 改成 0 关闭所有调试打印

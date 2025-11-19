@@ -24,6 +24,9 @@ public:
     void INIT();          // 上电初始化（相当于 INIT()）
     void INIT_MEAN();     // 零点归一（相当于 INIT_MEAN()）
     void READ();          // 更新四个量（相当于 READ()）
+    // 只对左右两路做就地归零（当前姿态记为 0°），不触碰 1~4
+    void REZERO_LR(uint16_t warmup_ms = 400, uint16_t N = 200);
+
     bool ZeroToReference(float refL_deg, float refR_deg, float ref1_deg, float ref2_deg, float ref3_deg, float ref4_deg,
         uint16_t N, uint32_t warmup_ms, uint32_t timeout_ms);
     

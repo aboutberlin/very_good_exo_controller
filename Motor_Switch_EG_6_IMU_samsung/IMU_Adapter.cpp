@@ -116,6 +116,31 @@ void IMU_Adapter::INIT_MEAN() {
                         off3_tmp, off4_tmp, off3, off4);
 }
 
+void IMU_Adapter::REZERO_LR(uint16_t warmup_ms, uint16_t N) {
+    // 只清左右两路的串口缓冲，避免脏数据
+    while (SerialImuLeft.available())  SerialImuLeft.read();
+    while (SerialImuRight.available()) SerialImuRight.read();
+
+    delay(warmup_ms);   // 给模块一点恢复时间（400~600ms够用）
+
+    float sumL = 0.0f, sumR = 0.0f;
+    for (uint16_t i = 0; i < N; ++i) {
+        READ();                 // 统一读一次（会更新六路），但我们只用 L/R
+        sumL += AngleXLeft;
+        sumR += AngleXRight;
+        delay(5);
+    }
+
+    // ✅ 就地置零：直接把当前均值作为偏置；不做 60–120° 夹紧
+    float offL_tmp = sumL / (float)N;
+    float offR_tmp = sumR / (float)N;
+
+    offL = offL_tmp;
+    offR = offR_tmp;
+
+    Serial.printf("[IMU] REZERO_LR: rawL=%.2f rawR=%.2f -> offL=%.2f offR=%.2f\r\n",
+                  offL_tmp, offR_tmp, offL, offR);
+}
 
 
 /* ------- 3. 每次循环更新 ------- */
