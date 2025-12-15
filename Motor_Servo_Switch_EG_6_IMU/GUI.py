@@ -292,10 +292,43 @@ class MainWindow(QWidget):
         # 放在 LogTag 行的下面一行
         grid.addLayout(auto_row, base_row + 2, 0, 1, cols)
 
-        # ==== ✅ 新增：SD 文件状态提示 ====
-        self.lbl_init_status = QLabel("SD log: FAIL")  # 默认就当没建成功
+        # ==== ✅ 新增：SD 文件状态提示 + L/R toggle 按钮（同一行右侧） ====
+        self._dir_bits = 0x03   # 默认 L=1, R=1（都“向上”）；bit0=Left, bit1=Right
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(10)
+
+        self.lbl_init_status = QLabel("SD log: FAIL")
         self.lbl_init_status.setStyleSheet("font-size:16px; color:#c62828; padding:6px;")
-        grid.addWidget(self.lbl_init_status, base_row + 3, 0, 1, cols)
+        status_row.addWidget(self.lbl_init_status)
+
+        status_row.addStretch(1)
+
+        def _make_small_btn(text, tip):
+            b = QPushButton(text)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedHeight(28)
+            b.setFixedWidth(54)
+            b.setToolTip(tip)
+            b.setStyleSheet("""
+                QPushButton { font-size:13px; font-weight:700; padding:2px 6px;
+                            border:1px solid #999; border-radius:8px; background:#f5f5f5; }
+                QPushButton:hover { background:#e0e0e0; }
+                QPushButton:pressed { background:#d5d5d5; }
+            """)
+            return b
+
+        self.btn_toggle_L = _make_small_btn("L↺", "Toggle Left direction bit")
+        self.btn_toggle_R = _make_small_btn("R↺", "Toggle Right direction bit")
+
+        self.btn_toggle_L.clicked.connect(self._toggle_left_dir)
+        self.btn_toggle_R.clicked.connect(self._toggle_right_dir)
+
+        status_row.addWidget(self.btn_toggle_L)
+        status_row.addWidget(self.btn_toggle_R)
+        self._update_dir_btn_text()   
+        grid.addLayout(status_row, base_row + 3, 0, 1, cols)
+
 
 
         # 右侧图区域
@@ -406,6 +439,24 @@ class MainWindow(QWidget):
         # 延迟清零
         QTimer.singleShot(100, lambda: setattr(self, "_motor_init_request", False))
 
+    def _update_dir_btn_text(self):
+        """根据 self._dir_bits 更新按钮文案。bit0=Left, bit1=Right"""
+        l = "+" if (self._dir_bits & 0x01) else "-"
+        r = "+" if (self._dir_bits & 0x02) else "-"
+        self.btn_toggle_L.setText(f"L:{l}")
+        self.btn_toggle_R.setText(f"R:{r}")
+
+    def _toggle_left_dir(self):
+        """点击左按钮：Left bit 取反，然后立即下发"""
+        self._dir_bits ^= 0x01
+        self._update_dir_btn_text()
+        self._tx_params()
+
+    def _toggle_right_dir(self):
+        """点击右按钮：Right bit 取反，然后立即下发"""
+        self._dir_bits ^= 0x02
+        self._update_dir_btn_text()
+        self._tx_params()
 
 
     def _auto_cycle_mile(self):
@@ -709,6 +760,7 @@ class MainWindow(QWidget):
         put_s16(23, max_torque_cfg)
         payload[25] = 1 if self._imu_init_request else 0
         payload[26] = 1 if self._motor_init_request else 0
+        payload[27] = int(self._dir_bits) & 0x03
 
 
         # [23..28] 保留位：保持为 0

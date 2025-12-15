@@ -11,7 +11,8 @@
 #include "RingBuf.h"
 #include "sdlogger.h" 
 
-#include "Motor_Control_Tmotor.h"
+// #include "Motor_Control_Tmotor.h"
+#include "Sig_Motor_Control.h"
 // SIG 所需 ID（如果已定义可跳过）
 const uint16_t ID_M1_POSVEL = (0x002<<5) | 0x009; // 0x049
 const uint16_t ID_M1_TORQUE = (0x002<<5) | 0x01C; // 0x05C
@@ -27,7 +28,7 @@ const uint16_t ID_M2_IQ = (0x001<<5) | 0x014; // 0x034
 //更换代码之前，rm -rf /home/joe/.cache/arduino/sketches/*
 
 // ====== Motor brand switch (0 = SIG, 1 = TMOTOR) ======
-#define MOTOR_BRAND 1 
+#define MOTOR_BRAND 0 
 
 #ifndef DEBUG_PRINT
 #define DEBUG_PRINT 1   // 改成 0 关闭所有调试打印
@@ -89,13 +90,13 @@ float initial_pos_2 = 0;
 
 /******************** if Tmoror ********************/
 
-Motor_Control_Tmotor sig_m1(0x002, 105); //right
-Motor_Control_Tmotor sig_m2(0x001, 104); //left
+// Motor_Control_Tmotor sig_m1(0x002, 105); //right
+// Motor_Control_Tmotor sig_m2(0x001, 104); //left
 
 /******************** if Sig ********************/
 
-// Motor_Control_Tmotor sig_m1(0x002, 3); //right
-// Motor_Control_Tmotor sig_m2(0x001, 3); //left
+Motor_Control_Tmotor sig_m1(0x002, 3); //right
+Motor_Control_Tmotor sig_m2(0x001, 3); //left
 // 通讯与传感
 Serial_Com Serial_Com;                // 你已有的串口通讯类
 IMU_Adapter imu;                      // IMU 适配器
@@ -120,7 +121,7 @@ int ctl_mode = 0;      // 0 for torque control, 1 for mit control
 int ctl_type = 0;      // 0 for motion, 1 for force tracking, 2 for direct torque   
 
 int sensor_type = 0;   // 0 for using IMU, 1 for using encoder   
-int l_ctl_dir = -1;      //确实是左脚，1是向上
+int l_ctl_dir = 1;      //确实是左脚，1是向上
 int r_ctl_dir = 1;     //确实是右脚，1是向上
 
 
@@ -989,7 +990,8 @@ void Receive_ble_Data() {
     if (data_rs232_rx[26] == 1) {
       motor_reinit_pending = true;  // ★ 新增占位
     }
-    // bytes [26..28] （甚至 [23..PAYLOAD_LEN-1]）为占位/保留
+    uint8_t dir_bits = (uint8_t)data_rs232_rx[27];
+    // bytes [28] （甚至 [23..PAYLOAD_LEN-1]）为占位/保留
     // 将来可以在这里继续解析更多字段，比如 max_torque_cfg 等
     // 现在我们就先忽略它们:
     // int16_t future_param = rd_i16((uint8_t*)data_rs232_rx, 23) / 100.0f;  // 示例
@@ -1021,6 +1023,10 @@ void Receive_ble_Data() {
     new_scale_all         = clampf(new_scale_all,        -1.0f, 1.0f);
     new_max_torque_cfg = clampf(new_max_torque_cfg, 0.0f, 15.0f);
 
+    int8_t new_l_ctl_dir = (dir_bits & 0x01) ? 1 : -1;
+    int8_t new_r_ctl_dir = (dir_bits & 0x02) ? 1 : -1;
+    
+
     /****************************************
      * 6) 根据开关, 决定是否写入全局控制变量
      ****************************************/
@@ -1043,6 +1049,8 @@ void Receive_ble_Data() {
     ext_gain          = new_ext_gain;
     scale_all         = new_scale_all;
     max_torque_cfg    = new_max_torque_cfg;
+    l_ctl_dir = new_l_ctl_dir;
+    r_ctl_dir = new_r_ctl_dir;
 #else
     // LOCKED模式: 我们不更新全局参数
     // 你可以在这里记录new_*用于debug (比如放到一个shadow_*里)
