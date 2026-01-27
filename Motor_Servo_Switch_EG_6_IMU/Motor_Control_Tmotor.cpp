@@ -59,7 +59,14 @@ bool Motor_Control_Tmotor::unpack_servo_telemetry(const CAN_message_t &msgR)
   uint8_t err_raw  = (uint8_t)msgR.buf[7];
 
   servo_pos_deg = (float)pos_int * 0.1f;
-  servo_spd_rpm = (float)spd_int * 10.0f;
+  servo_spd_rpm_elec = spd_int * 10.0f;
+  
+  servo_spd_rpm_motor =
+      servo_spd_rpm_elec / pole_pairs;
+  
+  servo_spd_rpm_output =
+      servo_spd_rpm_motor / gear_ratio;
+
   servo_cur_A   = (float)cur_int * 0.01f;
   servo_temp_C  = temp_raw;
   servo_error   = err_raw;
