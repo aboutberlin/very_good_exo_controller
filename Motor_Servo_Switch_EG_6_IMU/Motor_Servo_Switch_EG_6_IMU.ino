@@ -665,17 +665,12 @@ void loop() {
 
     // 这里如果你有 smooth_gate(...) 就直接用；没有就先直接打印原值或留 0
     #if DEBUG_PRINT
-    // Serial.printf("RTx=%.2f°  LTx=%.2f°  |  fR=%.2fHz  fL=%.2fHz  avg=%.2fHz\r\n",
-    //   imu.RTx, imu.LTx,
-    //   cycle_ms, ext_ms_L, ext_ms_R);
-    Serial.printf("fR=%.2fHz  fL=%.2fHz  avg=%.2fHz  |  ωL=%.2frad/s  ωR=%.2frad/s  |  τL=%.2f  τR=%.2f\r\n",
-      imu.RTx, imu.LTx, max_torque_cfg,
-      imu.RTx, imu.LTx,
-      M1_torque_command, M1_torque_command);
-    // Serial.printf("Rescale=%.2f  Flex=%.2f  Ext=%.2f  |  CmdM1=%.2f  CmdM2=%.2f  |  Delay=%.1fms\r\n",
-    //   Rescaling_gain, Flex_Assist_gain, Ext_Assist_gain,
-    //   M1_torque_command, M2_torque_command,
-    //   Assist_delay_gain);
+    Serial.printf(
+      "M1: pos=%.1fdeg  out_rpm=%.1f  I=%.2fA  T=%dC  err=%u | "
+      "M2: pos=%.1fdeg  out_rpm=%.1f  I=%.2fA  T=%dC  err=%u\r\n",
+      sig_m1.servo_pos_deg, sig_m1.servo_spd_rpm_out, sig_m1.servo_cur_A, (int)sig_m1.servo_temp_C, sig_m1.servo_error,
+      sig_m2.servo_pos_deg, sig_m2.servo_spd_rpm_out, sig_m2.servo_cur_A, (int)sig_m2.servo_temp_C, sig_m2.servo_error
+    );
     #endif
   }
 
