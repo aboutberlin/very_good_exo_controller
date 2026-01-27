@@ -849,7 +849,7 @@ class MainWindow(QWidget):
         R_angle = R_angle_i / 100.0
         L_tau   = L_tau_i   / 100.0
         R_tau   = R_tau_i   / 100.0
-        L_tau_d = L_tau_d_i / 100.0
+        L_tau_d = -L_tau_d_i / 100.0
         R_tau_d = R_tau_d_i / 100.0
         t       = (t_cs & 0xFFFF) / 100.0  # 0.01s 精度（~655.35s 回绕）
 
