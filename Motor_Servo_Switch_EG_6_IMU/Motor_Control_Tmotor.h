@@ -41,11 +41,19 @@ class Motor_Control_Tmotor
     float temp = 0.0f;    // (MIT) 你原本是 uint_to_float 映射
 
     // ===== 新增：伺服上传字段（按你文档的标定）=====
-    float servo_pos_deg = 0.0f;     // pos_int * 0.1  => deg
-    float servo_spd_rpm = 0.0f;     // spd_int * 10   => rpm (电气转速)
-    float servo_cur_A   = 0.0f;     // cur_int * 0.01 => A
-    int8_t servo_temp_C = 0;        // raw byte
-    uint8_t servo_error = 0;        // raw byte
+    float servo_pos_deg = 0;
+    float servo_spd_rpm_elec = 0;   // <-- 建议改名：明确是电气rpm
+    float servo_cur_A = 0;
+    float servo_temp_C = 0;
+    uint8_t servo_error = 0;
+
+    // ---- derived ----
+    float servo_spd_rpm_motor = 0;   // 电机轴机械rpm
+    float servo_spd_rpm_out   = 0;   // 输出轴机械rpm
+
+    // params
+    uint16_t pole_pairs = 21;        // 你的极对数（21对）
+    float gear_ratio = 9.0f;         // 你的减速比（9:1）
 
 
     FlexCAN_T4<CAN3, RX_SIZE_256, TX_SIZE_16> Can3;
