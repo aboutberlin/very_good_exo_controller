@@ -1,4 +1,4 @@
-
+# You can comment // #include "MovingAverage.h"!!! not used
 # 🧠 Hip-Exo 通信协议修改指南
 
 > 本文档说明：当需要新增、删除或修改从 **Teensy ↔ GUI** 传输的参数（例如 `max_torque_cfg` 、`gait_freq` 等），需要在 **Teensy 端** 与 **GUI 端** 同步修改的部分。
